@@ -1,0 +1,196 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.2.5</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>com.example</groupId>
+    <artifactId>orders-spring-app</artifactId>
+    <version>1.0.0</version>
+    <packaging>jar</packaging>
+
+    <name>orders-spring-app</name>
+    <description>Spring Boot CRUD con Azure SQL Database y OpenTelemetry zero-code hacia New Relic</description>
+
+    <properties>
+        <java.version>17</java.version>
+        <otel-agent.version>2.10.0</otel-agent.version>
+    </properties>
+
+    <dependencies>
+        <!-- Spring Boot Web -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+
+        <!-- Validación Bean -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
+
+        <!-- Actuator para health checks y métricas -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+
+        <!-- Spring Data JPA -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-jpa</artifactId>
+        </dependency>
+
+        <!-- Microsoft SQL Server JDBC driver -->
+        <dependency>
+            <groupId>com.microsoft.sqlserver</groupId>
+            <artifactId>mssql-jdbc</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!-- OpenTelemetry API para leer el trace ID activo en filtros.
+             El agente (javaagent) provee la implementacion en runtime;
+             esta dependencia solo aporta las interfaces de compilacion. -->
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-api</artifactId>
+            <version>1.44.1</version>
+        </dependency>
+
+        <!-- Spring Security para Basic Auth -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-security</artifactId>
+        </dependency>
+
+        <!-- Tests -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!-- Plugin principal de Spring Boot -->
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+
+            <!--
+                Descarga el agente OpenTelemetry durante la fase prepare-package.
+                El JAR queda en target/otel-javaagent.jar y se despliega junto
+                con la aplicación en App Service.
+                No se añade código OTEL a la aplicación (zero-code instrumentation).
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-dependency-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>download-otel-agent</id>
+                        <phase>prepare-package</phase>
+                        <goals>
+                            <goal>copy</goal>
+                        </goals>
+                        <configuration>
+                            <artifactItems>
+                                <artifactItem>
+                                    <groupId>io.opentelemetry.javaagent</groupId>
+                                    <artifactId>opentelemetry-javaagent</artifactId>
+                                    <version>${otel-agent.version}</version>
+                                    <type>jar</type>
+                                    <destFileName>otel-javaagent.jar</destFileName>
+                                </artifactItem>
+                            </artifactItems>
+                            <outputDirectory>${project.build.directory}</outputDirectory>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <!-- Plugin Azure App Service (opcional: despliegue directo con mvn azure-webapp:deploy) -->
+            <plugin>
+                <groupId>com.microsoft.azure</groupId>
+                <artifactId>azure-webapp-maven-plugin</artifactId>
+                <version>2.13.0</version>
+                <configuration>
+                    <schemaVersion>v2</schemaVersion>
+                    <subscriptionId>${env.AZURE_SUBSCRIPTION_ID}</subscriptionId>
+                    <resourceGroup>${env.AZURE_RESOURCE_GROUP}</resourceGroup>
+                    <appName>${env.AZURE_APP_NAME}</appName>
+                    <region>${env.AZURE_REGION}</region>
+                    <pricingTier>B2</pricingTier>
+                    <runtime>
+                        <os>Linux</os>
+                        <javaVersion>Java 17</javaVersion>
+                        <webContainer>Java SE</webContainer>
+                    </runtime>
+                    <deployment>
+                        <resources>
+                            <!-- Despliega el JAR de la app y el agente OTEL -->
+                            <resource>
+                                <directory>${project.build.directory}</directory>
+                                <includes>
+                                    <include>${project.artifactId}-${project.version}.jar</include>
+                                    <include>otel-javaagent.jar</include>
+                                </includes>
+                            </resource>
+                        </resources>
+                    </deployment>
+                    <appSettings>
+                        <!--
+                            JAVA_TOOL_OPTIONS activa el agente OTEL sin modificar código.
+                            El resto de variables se configuran en App Service > Configuration.
+                        -->
+                        <property>
+                            <name>JAVA_TOOL_OPTIONS</name>
+                            <value>-javaagent:/home/site/wwwroot/otel-javaagent.jar -Xmx512m</value>
+                        </property>
+                        <property>
+                            <name>OTEL_SERVICE_NAME</name>
+                            <value>orders-spring-app</value>
+                        </property>
+                        <property>
+                            <name>OTEL_EXPORTER_OTLP_PROTOCOL</name>
+                            <value>http/protobuf</value>
+                        </property>
+                        <property>
+                            <name>OTEL_LOGS_EXPORTER</name>
+                            <value>otlp</value>
+                        </property>
+                        <property>
+                            <name>OTEL_METRICS_EXPORTER</name>
+                            <value>otlp</value>
+                        </property>
+                        <property>
+                            <name>OTEL_TRACES_EXPORTER</name>
+                            <value>otlp</value>
+                        </property>
+                        <!-- Captura key-value pairs del API fluida SLF4J 2.x y atributos MDC.
+                             El level llega automaticamente como severityText; estas variables
+                             habilitan los campos adicionales (http.method, http.target, etc.) -->
+                        <property>
+                            <name>OTEL_INSTRUMENTATION_LOGBACK_APPENDER_EXPERIMENTAL_CAPTURE_KEY_VALUE_PAIR_ATTRIBUTES</name>
+                            <value>true</value>
+                        </property>
+                        <property>
+                            <name>OTEL_INSTRUMENTATION_LOGBACK_APPENDER_EXPERIMENTAL_CAPTURE_MDC_ATTRIBUTES</name>
+                            <value>*</value>
+                        </property>
+                    </appSettings>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>

@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+
+    <!--
+        Incluye los defaults de Spring Boot (pattern CONSOLE_LOG_PATTERN,
+        colores ANSI, etc.) y el appender CONSOLE estándar.
+        Los niveles definidos en application.yml (logging.level.*) siguen
+        siendo aplicados por Spring Boot encima de esta configuración.
+    -->
+    <include resource="org/springframework/boot/logging/logback/defaults.xml"/>
+    <include resource="org/springframework/boot/logging/logback/console-appender.xml"/>
+
+    <!--
+        Inyecta MDC["level"] antes de cada evento de log.
+        El agente OTel exporta el MDC como atributos del LogRecord cuando
+        OTEL_INSTRUMENTATION_LOGBACK_APPENDER_EXPERIMENTAL_CAPTURE_MDC_ATTRIBUTES=*
+        está activo, lo que garantiza que "level" llegue a New Relic como
+        atributo explícito (y no solo como campo severityText del protocolo OTel).
+    -->
+    <turboFilter class="com.example.ordersapp.logging.LevelMdcTurboFilter"/>
+
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+    </root>
+
+</configuration>
