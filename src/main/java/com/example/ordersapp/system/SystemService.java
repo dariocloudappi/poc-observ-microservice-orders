@@ -7,7 +7,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
-import com.example.ordersapp.service.UserValidationService;
+import com.example.ordersapp.services.UserValidationService;
 
 import java.util.List;
 

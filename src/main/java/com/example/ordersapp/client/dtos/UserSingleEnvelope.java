@@ -1,4 +1,4 @@
-package com.example.ordersapp.client.dto;
+package com.example.ordersapp.client.dtos;
 
 public class UserSingleEnvelope {
 

@@ -1,0 +1,487 @@
+# =============================================================================
+# deploy.yml - build and deploy microservice-orders to Azure App Service
+# -----------------------------------------------------------------------------
+# Authentication uses OIDC federated credentials: no client secret is stored
+# anywhere. Sensitive values come from GitHub Secrets and reach Bicep through
+# environment variables, so they never appear as command line arguments.
+#
+# Unlike microservice-users, this service runs with ddl-auto: none, so the
+# pipeline applies src/main/resources/database.sql after provisioning the
+# database and before deploying the application.
+# =============================================================================
+
+name: deploy
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  workflow_dispatch:
+    inputs:
+      auto_destroy_minutes:
+        description: 'Minutes before the resource group is deleted automatically. 0 disables the automatic cleanup'
+        required: false
+        default: '60'
+      observability_enabled:
+        description: 'Attach the OpenTelemetry agent and export to New Relic'
+        required: false
+        default: 'true'
+      apply_schema:
+        description: 'Apply src/main/resources/database.sql to the database'
+        required: false
+        default: 'true'
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-microservice-orders
+  cancel-in-progress: false
+
+env:
+  AZURE_LOCATION: ${{ vars.AZURE_LOCATION || 'westeurope' }}
+  AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP || 'rg-ordersvc' }}
+  POC_NAME_PREFIX: ${{ vars.POC_NAME_PREFIX || 'ordersvc' }}
+  POC_OWNER: ${{ vars.POC_OWNER || 'unknown' }}
+  POC_TTL: ${{ vars.POC_TTL || '1h' }}
+  LOG_RETENTION_DAYS: ${{ vars.LOG_RETENTION_DAYS || '30' }}
+  LOG_DAILY_QUOTA_GB: ${{ vars.LOG_DAILY_QUOTA_GB || '1' }}
+  ENABLE_ACTIVITY_LOG_EXPORT: ${{ vars.ENABLE_ACTIVITY_LOG_EXPORT || 'false' }}
+  ENABLE_LOG_ANALYTICS: ${{ vars.ENABLE_LOG_ANALYTICS || 'true' }}
+  ENABLE_SQL_AUDIT: ${{ vars.ENABLE_SQL_AUDIT || 'true' }}
+  SQL_LOG_LEVEL: ${{ vars.SQL_LOG_LEVEL || 'INFO' }}
+  APP_SERVICE_SKU: ${{ vars.APP_SERVICE_SKU || 'B1' }}
+  SQL_SKU_NAME: ${{ vars.SQL_SKU_NAME || 'Basic' }}
+  SQL_DATABASE_NAME: ${{ vars.SQL_DATABASE_NAME || 'sqldb-orders' }}
+  ENVIRONMENT: ${{ vars.ENVIRONMENT || 'poc' }}
+  SERVICE_NAMESPACE: ${{ vars.SERVICE_NAMESPACE || 'poc-observability' }}
+  OTEL_SERVICE_NAME: ${{ vars.OTEL_SERVICE_NAME || 'microservice-orders' }}
+  NR_OTLP_ENDPOINT: ${{ vars.NR_OTLP_ENDPOINT || 'https://otlp.eu01.nr-data.net:4318' }}
+  LOG_LEVEL: ${{ vars.LOG_LEVEL || 'INFO' }}
+  USERS_SERVICE_URL: ${{ vars.USERS_SERVICE_URL }}
+
+jobs:
+
+  deploy:
+    name: Build and deploy
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Mask every secret before it can reach a log line.
+      - name: Mask sensitive values
+        env:
+          SQL_ADMIN_USER: ${{ secrets.SQL_ADMIN_USER }}
+          SQL_ADMIN_PASSWORD: ${{ secrets.SQL_ADMIN_PASSWORD }}
+          API_USERNAME: ${{ secrets.API_USERNAME }}
+          API_PASSWORD: ${{ secrets.API_PASSWORD }}
+          USERS_SERVICE_USERNAME: ${{ secrets.USERS_SERVICE_USERNAME }}
+          USERS_SERVICE_PASSWORD: ${{ secrets.USERS_SERVICE_PASSWORD }}
+          NR_LICENSE_KEY: ${{ secrets.NR_LICENSE_KEY }}
+        run: |
+          for name in SQL_ADMIN_USER SQL_ADMIN_PASSWORD API_USERNAME API_PASSWORD \
+                      USERS_SERVICE_USERNAME USERS_SERVICE_PASSWORD NR_LICENSE_KEY; do
+            value="${!name}"
+            if [ -z "$value" ]; then
+              echo "ERROR: required secret $name is not configured in the repository" >&2
+              exit 1
+            fi
+            echo "::add-mask::$value"
+          done
+          echo "All required secrets are present."
+
+      - name: Validate non secret configuration
+        run: |
+          if [ -z "$USERS_SERVICE_URL" ]; then
+            echo "ERROR: the repository variable USERS_SERVICE_URL must be set." >&2
+            echo "It is the base url of the users microservice, for example" >&2
+            echo "https://app-usersvc-xxxxx.azurewebsites.net (no trailing slash)." >&2
+            exit 1
+          fi
+          case "$USERS_SERVICE_URL" in
+            */) echo "ERROR: USERS_SERVICE_URL must not end with a slash" >&2; exit 1 ;;
+          esac
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Build with Maven
+        run: mvn -B -ntp clean package
+
+      # The Java SE image starts /home/site/wwwroot/app.jar, so the artifact is
+      # renamed. The agent jar travels in the same package.
+      - name: Assemble the deployment package
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          app_jar=$(find target -maxdepth 1 -name '*.jar' ! -name 'otel-javaagent.jar' ! -name '*-sources.jar' | head -1)
+          if [ -z "$app_jar" ]; then
+            echo "ERROR: application jar not found in target/" >&2
+            exit 1
+          fi
+          if [ ! -f target/otel-javaagent.jar ]; then
+            echo "ERROR: target/otel-javaagent.jar not found. Check the maven-dependency-plugin execution." >&2
+            exit 1
+          fi
+          cp "$app_jar" dist/app.jar
+          cp target/otel-javaagent.jar dist/otel-javaagent.jar
+          # startup.sh es el comando de arranque del App Service: adjunta el
+          # agente solo si el jar esta presente, en vez de tumbar la JVM.
+          cp startup.sh dist/startup.sh
+          (cd dist && zip -q -r ../app.zip .)
+          ls -la dist app.zip
+
+      # Prints the exact "sub" claim that Azure has to match in the federated
+      # credential. The repository name is not something you can choose: it is
+      # whatever GitHub puts in the token. If the login below fails with
+      # AADSTS70021, copy the value printed here into the federated credential.
+      # Only the claims are printed, never the token.
+      - name: Show the OIDC subject expected by Azure
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          token=$(curl -sS -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://AzureADTokenExchange" | jq -r .value)
+          echo "::add-mask::${token}"
+
+          payload=$(echo "$token" | cut -d. -f2)
+          case $(( ${#payload} % 4 )) in
+            2) payload="${payload}==" ;;
+            3) payload="${payload}=" ;;
+          esac
+          claims=$(echo "$payload" | tr '_-' '/+' | base64 -d 2>/dev/null)
+
+          subject=$(echo "$claims" | jq -r .sub)
+          echo "$claims" | jq '{sub, repository, repository_id, repository_owner, ref, workflow}'
+
+          {
+            echo "### OIDC subject of this run"
+            echo
+            echo '```'
+            echo "$subject"
+            echo '```'
+            echo
+            echo "This is the exact value the federated credential must carry in its \`subject\` field."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Azure login with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install Bicep CLI
+        run: az bicep install
+
+      # ---------------------------------------------------------------------
+      # Infrastructure
+      # ---------------------------------------------------------------------
+      - name: Deploy infrastructure
+        id: infra
+        env:
+          SQL_ADMIN_USER: ${{ secrets.SQL_ADMIN_USER }}
+          SQL_ADMIN_PASSWORD: ${{ secrets.SQL_ADMIN_PASSWORD }}
+          API_USERNAME: ${{ secrets.API_USERNAME }}
+          API_PASSWORD: ${{ secrets.API_PASSWORD }}
+          USERS_SERVICE_USERNAME: ${{ secrets.USERS_SERVICE_USERNAME }}
+          USERS_SERVICE_PASSWORD: ${{ secrets.USERS_SERVICE_PASSWORD }}
+          NR_LICENSE_KEY: ${{ secrets.NR_LICENSE_KEY }}
+          OBSERVABILITY_ENABLED: ${{ github.event_name == 'workflow_dispatch' && inputs.observability_enabled || 'true' }}
+        run: |
+          set -euo pipefail
+          # The .bicepparam file declares its own template through "using",
+          # so --template-file must not be passed here.
+          outputs=$(az deployment sub create \
+            --name "orders-${GITHUB_RUN_ID}" \
+            --location "$AZURE_LOCATION" \
+            --parameters infra/main.bicepparam \
+            --query properties.outputs -o json)
+
+          echo "webapp_name=$(echo "$outputs" | jq -r .webAppName.value)" >> "$GITHUB_OUTPUT"
+          echo "webapp_url=$(echo "$outputs" | jq -r .webAppUrl.value)" >> "$GITHUB_OUTPUT"
+          echo "workspace_name=$(echo "$outputs" | jq -r .logAnalyticsWorkspaceName.value)" >> "$GITHUB_OUTPUT"
+          echo "sql_server=$(echo "$outputs" | jq -r .sqlServerName.value)" >> "$GITHUB_OUTPUT"
+          echo "sql_fqdn=$(echo "$outputs" | jq -r .sqlServerFqdn.value)" >> "$GITHUB_OUTPUT"
+          echo "sql_database=$(echo "$outputs" | jq -r .sqlDatabaseName.value)" >> "$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------------------
+      # Database schema
+      # -----------------------------------------------------------------
+      # ddl-auto is none, so the tables have to be created explicitly. The
+      # runner is outside Azure, so it needs a temporary firewall rule that is
+      # always removed afterwards.
+      # ---------------------------------------------------------------------
+      - name: Open the firewall for this runner
+        id: firewall
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.apply_schema == 'true' }}
+        run: |
+          set -euo pipefail
+          runner_ip=$(curl -s --max-time 15 https://api.ipify.org)
+          if [ -z "$runner_ip" ]; then
+            echo "ERROR: could not determine the public IP of the runner" >&2
+            exit 1
+          fi
+          rule="gh-runner-${GITHUB_RUN_ID}"
+          echo "rule_name=${rule}" >> "$GITHUB_OUTPUT"
+          az sql server firewall-rule create \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --server "${{ steps.infra.outputs.sql_server }}" \
+            --name "$rule" \
+            --start-ip-address "$runner_ip" \
+            --end-ip-address "$runner_ip" \
+            --output none
+          echo "Temporary firewall rule ${rule} created."
+
+      - name: Apply the database schema
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.apply_schema == 'true' }}
+        uses: azure/sql-action@v2
+        with:
+          # The script is idempotent, so it can run on every deployment.
+          connection-string: 'Server=tcp:${{ steps.infra.outputs.sql_fqdn }},1433;Initial Catalog=${{ steps.infra.outputs.sql_database }};Persist Security Info=False;User ID=${{ secrets.SQL_ADMIN_USER }};Password=${{ secrets.SQL_ADMIN_PASSWORD }};MultipleActiveResultSets=False;Encrypt=True;TrustServerCertificate=False;Connection Timeout=60;'
+          path: ./src/main/resources/database.sql
+
+      - name: Close the firewall for this runner
+        if: ${{ always() && steps.firewall.outputs.rule_name != '' }}
+        run: |
+          set -euo pipefail
+          az sql server firewall-rule delete \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --server "${{ steps.infra.outputs.sql_server }}" \
+            --name "${{ steps.firewall.outputs.rule_name }}" \
+            --output none || true
+          echo "Temporary firewall rule removed."
+
+      # ---------------------------------------------------------------------
+      # Application
+      # ---------------------------------------------------------------------
+      # Reads the settings back from the running app and fails if any of them
+      # does not match what was just deployed. This catches the case where a
+      # changed GitHub secret or variable does not reach the web app.
+      - name: Verify the effective application settings
+        env:
+          APP: ${{ steps.infra.outputs.webapp_name }}
+        run: |
+          set -euo pipefail
+          settings=$(az webapp config appsettings list \
+            --resource-group "$AZURE_RESOURCE_GROUP" --name "$APP" -o json)
+
+          check() {
+            local name="$1" expected="$2"
+            local actual
+            actual=$(echo "$settings" | jq -r --arg n "$name" '.[] | select(.name==$n) | .value')
+            if [ "$actual" != "$expected" ]; then
+              echo "ERROR: ${name} is '${actual}' but '${expected}' was deployed" >&2
+              return 1
+            fi
+            echo "  ${name} = ${actual}"
+          }
+
+          echo "Effective settings:"
+          check ENVIRONMENT "$ENVIRONMENT"
+          check OTEL_SERVICE_NAME "$OTEL_SERVICE_NAME"
+          check LOG_LEVEL "$LOG_LEVEL"
+          check SQL_LOG_LEVEL "$SQL_LOG_LEVEL"
+          check OTEL_EXPORTER_OTLP_ENDPOINT "$NR_OTLP_ENDPOINT"
+          check SQL_DATABASE "$SQL_DATABASE_NAME"
+          check USERS_SERVICE_URL "$USERS_SERVICE_URL"
+          echo "Every checked setting matches the deployed value."
+
+      # --track-status polls the runtime status of the app after uploading and
+      # can hang for a Java app that takes a while to boot. The readiness of
+      # the app is verified right after by the health smoke test instead.
+      - name: Deploy the application package
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          az webapp deploy \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "${{ steps.infra.outputs.webapp_name }}" \
+            --src-path app.zip \
+            --type zip \
+            --restart true \
+            --clean true \
+            --track-status false \
+            --timeout 900
+
+      # A restart guarantees the app picks up any setting changed in this run,
+      # even when the package itself did not change.
+      - name: Restart the web app
+        run: |
+          set -euo pipefail
+          az webapp restart \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "${{ steps.infra.outputs.webapp_name }}"
+
+      # ---------------------------------------------------------------------
+      # Smoke tests over HTTPS
+      # ---------------------------------------------------------------------
+      - name: Smoke test - health endpoint
+        env:
+          URL: ${{ steps.infra.outputs.webapp_url }}
+        run: |
+          set -euo pipefail
+          echo "Waiting for ${URL}/actuator/health ..."
+          for attempt in $(seq 1 40); do
+            body=$(curl --silent --show-error --max-time 15 "${URL}/actuator/health" || true)
+            if echo "$body" | grep -q '"status":"UP"'; then
+              echo "Application is healthy after ${attempt} attempt(s)."
+              echo "$body"
+              exit 0
+            fi
+            echo "  not ready yet, retrying in 15s ..."
+            sleep 15
+          done
+          echo "ERROR: the application never reported status UP." >&2
+          echo "Last response: ${body}" >&2
+          exit 1
+
+      - name: Smoke test - TLS and anonymous access
+        env:
+          URL: ${{ steps.infra.outputs.webapp_url }}
+        run: |
+          set -euo pipefail
+          host="${URL#https://}"
+
+          # The certificate chain is validated: no --insecure anywhere.
+          curl --silent --show-error --output /dev/null "https://${host}/actuator/health"
+          echo "Certificate chain validated."
+
+          # httpsOnly redirects plain HTTP.
+          code=$(curl --silent --output /dev/null --write-out '%{http_code}' "http://${host}/actuator/health")
+          echo "Plain HTTP returned ${code}"
+          case "$code" in
+            30*) echo "HTTP is redirected to HTTPS, as expected." ;;
+            200) echo "ERROR: the application answered over plain HTTP" >&2; exit 1 ;;
+            *) echo "Unexpected status ${code} over plain HTTP" ;;
+          esac
+
+          # The business endpoints must reject anonymous traffic. Every order
+          # endpoint hangs from /users/{userId}/orders.
+          probe="/users/00000000-0000-0000-0000-000000000000/orders"
+          code=$(curl --silent --output /dev/null --write-out '%{http_code}' "${URL}${probe}")
+          echo "${probe} without credentials returned ${code}"
+          if [ "$code" != "401" ]; then
+            echo "ERROR: the order endpoints should reject anonymous requests" >&2
+            exit 1
+          fi
+
+      # /status runs SELECT 1 against Azure SQL, so it proves the database link
+      # without depending on the users service. It answers 503 when any of its
+      # three checks fails, so the body is parsed instead of the status code.
+      - name: Smoke test - database link
+        env:
+          URL: ${{ steps.infra.outputs.webapp_url }}
+          API_USERNAME: ${{ secrets.API_USERNAME }}
+          API_PASSWORD: ${{ secrets.API_PASSWORD }}
+        run: |
+          set -euo pipefail
+          body=$(curl --silent --show-error --max-time 60 \
+            --user "${API_USERNAME}:${API_PASSWORD}" "${URL}/status")
+          echo "$body" | jq .
+
+          db_status=$(echo "$body" | jq -r '.services[] | select(.name=="database") | .status')
+          echo "database check: ${db_status}"
+          if [ "$db_status" != "ok" ]; then
+            echo "ERROR: the application cannot query Azure SQL." >&2
+            exit 1
+          fi
+          echo "The application queried Azure SQL successfully."
+
+      # Every order endpoint validates the owner against the users service
+      # first, so this also exercises the downstream link. The users service is
+      # a separate deployment, so a failure here is reported but does not fail
+      # the pipeline.
+      - name: Check the link with the users service
+        continue-on-error: true
+        env:
+          URL: ${{ steps.infra.outputs.webapp_url }}
+          API_USERNAME: ${{ secrets.API_USERNAME }}
+          API_PASSWORD: ${{ secrets.API_PASSWORD }}
+        run: |
+          set -euo pipefail
+          body=$(curl --silent --show-error --max-time 60 \
+            --user "${API_USERNAME}:${API_PASSWORD}" "${URL}/status" || true)
+          users_status=$(echo "$body" | jq -r '.services[] | select(.name=="external_api_users") | .status' || true)
+          echo "external_api_users check: ${users_status}"
+
+          # An unknown user must come back as 404: that means the users service
+          # answered. 503 means it is unreachable.
+          probe="/users/00000000-0000-0000-0000-000000000000/orders"
+          code=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            --user "${API_USERNAME}:${API_PASSWORD}" "${URL}${probe}")
+          echo "GET ${probe} returned ${code}"
+
+          case "$code" in
+            404|200) echo "The users service is reachable and the order chain works." ;;
+            503) echo "WARNING: the users service is unreachable. Check the USERS_SERVICE_URL variable and the USERS_SERVICE_* credentials." ;;
+            *) echo "WARNING: unexpected status ${code}." ;;
+          esac
+
+      - name: Deployment summary
+        if: always()
+        env:
+          URL: ${{ steps.infra.outputs.webapp_url }}
+          APP: ${{ steps.infra.outputs.webapp_name }}
+          WORKSPACE: ${{ steps.infra.outputs.workspace_name }}
+          SQL_FQDN: ${{ steps.infra.outputs.sql_fqdn }}
+        run: |
+          {
+            echo "## microservice-orders deployed"
+            echo
+            echo "| Item | Value |"
+            echo "|------|-------|"
+            echo "| URL | ${URL} |"
+            echo "| Web app | ${APP} |"
+            echo "| Resource group | ${AZURE_RESOURCE_GROUP} |"
+            echo "| SQL server | ${SQL_FQDN} |"
+            echo "| Log Analytics workspace | ${WORKSPACE} |"
+            echo "| Users service | ${USERS_SERVICE_URL} |"
+            echo "| App Service SKU | ${APP_SERVICE_SKU} |"
+            echo "| SQL SKU | ${SQL_SKU_NAME} |"
+            echo
+            echo "Remember to run the destroy workflow when the PoC is over."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # -------------------------------------------------------------------------
+  # Automatic cleanup, so a forgotten PoC does not keep billing
+  # -------------------------------------------------------------------------
+  auto-destroy:
+    name: Automatic cleanup
+    needs: deploy
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.auto_destroy_minutes != '0' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+
+      - name: Wait for the configured TTL
+        env:
+          MINUTES: ${{ inputs.auto_destroy_minutes }}
+        run: |
+          set -euo pipefail
+          echo "Waiting ${MINUTES} minute(s) before deleting ${AZURE_RESOURCE_GROUP}."
+          sleep "$(( MINUTES * 60 ))"
+
+      - name: Azure login with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Delete the resource group
+        run: |
+          set -euo pipefail
+          echo "Deleting resource group ${AZURE_RESOURCE_GROUP}"
+          az group delete --name "$AZURE_RESOURCE_GROUP" --yes
+          echo "Resource group deleted."

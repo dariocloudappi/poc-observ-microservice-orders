@@ -1,0 +1,153 @@
+# =============================================================================
+# destroy.yml - remove every resource of the PoC
+# -----------------------------------------------------------------------------
+#   1. Manual run: deletes the resource group after an explicit confirmation.
+#   2. Scheduled run: deletes any resource group tagged with
+#      project=poc-microservice-orders whose createdAt tag is older than the
+#      configured maximum age. Only active when the repository variable
+#      ENABLE_SCHEDULED_CLEANUP is set to true.
+# =============================================================================
+
+name: destroy
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type DESTROY to confirm the deletion of the resource group'
+        required: true
+        default: ''
+      resource_group:
+        description: 'Resource group to delete. Empty means the value of the AZURE_RESOURCE_GROUP variable'
+        required: false
+        default: ''
+  schedule:
+    - cron: '29 * * * *'
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: destroy-microservice-orders
+  cancel-in-progress: false
+
+env:
+  AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP || 'rg-ordersvc' }}
+  POC_NAME_PREFIX: ${{ vars.POC_NAME_PREFIX || 'ordersvc' }}
+  POC_MAX_AGE_HOURS: ${{ vars.POC_MAX_AGE_HOURS || '2' }}
+
+jobs:
+
+  destroy:
+    name: Delete the PoC resource group
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Check the confirmation
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.confirm }}" != "DESTROY" ]; then
+            echo "ERROR: confirmation not provided. Type DESTROY to run this workflow." >&2
+            exit 1
+          fi
+
+      - name: Azure login with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # Subscription diagnostic settings live outside the resource group, so
+      # they survive its deletion unless removed explicitly.
+      - name: Remove the Activity Log diagnostic setting
+        run: |
+          set -euo pipefail
+          name="diag-activitylog-${POC_NAME_PREFIX}"
+          if az monitor diagnostic-settings subscription list --query "value[?name=='${name}']" -o tsv | grep -q .; then
+            az monitor diagnostic-settings subscription delete --name "$name" --yes
+            echo "Diagnostic setting ${name} deleted."
+          else
+            echo "Diagnostic setting ${name} not found, nothing to do."
+          fi
+
+      - name: Delete the resource group
+        env:
+          TARGET_RG: ${{ inputs.resource_group }}
+        run: |
+          set -euo pipefail
+          rg="${TARGET_RG:-}"
+          if [ -z "$rg" ]; then
+            rg="$AZURE_RESOURCE_GROUP"
+          fi
+
+          if ! az group exists --name "$rg" | grep -q true; then
+            echo "Resource group ${rg} does not exist. Nothing to delete."
+            exit 0
+          fi
+
+          echo "Resources about to be deleted in ${rg}:"
+          az resource list --resource-group "$rg" --query "[].{name:name,type:type}" -o table || true
+
+          az group delete --name "$rg" --yes
+          echo "Resource group ${rg} deleted."
+
+      - name: Cleanup summary
+        if: always()
+        run: |
+          {
+            echo "## PoC destroyed"
+            echo
+            echo "Resource group: ${AZURE_RESOURCE_GROUP}"
+            echo
+            echo "The Azure SQL server, its database and every order stored in it are gone."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  scheduled-cleanup:
+    name: Delete expired PoC resource groups
+    if: ${{ github.event_name == 'schedule' && vars.ENABLE_SCHEDULED_CLEANUP == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Azure login with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Delete resource groups older than the maximum age
+        run: |
+          set -euo pipefail
+          now=$(date -u +%s)
+          max_age=$(( POC_MAX_AGE_HOURS * 3600 ))
+
+          groups=$(az group list \
+            --query "[?tags.project=='poc-microservice-orders' && tags.environment=='poc'].{name:name,createdAt:tags.createdAt}" \
+            -o json)
+
+          echo "$groups" | jq -c '.[]' | while read -r item; do
+            name=$(echo "$item" | jq -r .name)
+            created=$(echo "$item" | jq -r .createdAt)
+
+            if [ "$created" = "null" ] || [ -z "$created" ]; then
+              echo "Skipping ${name}: no createdAt tag."
+              continue
+            fi
+
+            created_ts=$(date -u -d "$created" +%s 2>/dev/null || echo 0)
+            if [ "$created_ts" -eq 0 ]; then
+              echo "Skipping ${name}: unreadable createdAt tag (${created})."
+              continue
+            fi
+
+            age=$(( now - created_ts ))
+            if [ "$age" -gt "$max_age" ]; then
+              echo "Deleting ${name}: age $(( age / 60 )) minutes exceeds ${POC_MAX_AGE_HOURS}h."
+              az group delete --name "$name" --yes --no-wait
+            else
+              echo "Keeping ${name}: age $(( age / 60 )) minutes."
+            fi
+          done

@@ -15,7 +15,11 @@ spring:
   jpa:
     hibernate:
       ddl-auto: none
-    show-sql: true
+    # Deliberately false: show-sql writes straight to System.out, which the OTel
+    # agent does not instrument, so those lines never reach New Relic. The
+    # org.hibernate.SQL logger below goes through Logback, which the agent does
+    # instrument.
+    show-sql: false
     properties:
       hibernate:
         dialect: org.hibernate.dialect.SQLServerDialect
@@ -53,7 +57,19 @@ logging:
   level:
     root: INFO
     com.example: ${LOG_LEVEL:INFO}
-    com.example.ordersapp: DEBUG
-    org.hibernate.SQL: WARN
+    # DEBUG por defecto, como hasta ahora, pero ahora la variable LOG_LEVEL
+    # manda de verdad: con el valor fijo, este logger mas especifico ganaba
+    # siempre a com.example y LOG_LEVEL no tenia ningun efecto sobre la
+    # aplicacion.
+    com.example.ordersapp: ${LOG_LEVEL:DEBUG}
+    # Every statement Hibernate executes, as a log record correlated with its
+    # trace. Set SQL_LOG_LEVEL=DEBUG to enable it.
+    # The logger name is declared here and not as a LOGGING_LEVEL_ORG_HIBERNATE_SQL
+    # app setting on purpose: relaxed binding lowercases environment variable
+    # names, and "org.hibernate.sql" is a different logger than "org.hibernate.SQL".
+    org.hibernate.SQL: ${SQL_LOG_LEVEL:INFO}
+    # Bind parameter values. Only useful with SQL_LOG_LEVEL=DEBUG, and it prints
+    # the data sent to the database, so keep it off unless you are debugging.
+    org.hibernate.orm.jdbc.bind: ${SQL_BIND_LOG_LEVEL:INFO}
   pattern:
     console: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"

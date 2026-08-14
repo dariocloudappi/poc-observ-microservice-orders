@@ -19,9 +19,10 @@ FROM eclipse-temurin:17-jre-alpine
 
 WORKDIR /app
 
-# Copiar el JAR de la aplicación y el agente OTEL desde el build stage
-COPY --from=build /build/targetv6/orders-spring-app-1.0.0.jar app.jar
-COPY --from=build /build/targetv6/otel-javaagent.jar otel-javaagent.jar
+# Copiar el JAR de la aplicacion y el agente OTEL desde el build stage.
+# El directorio de salida de Maven es target/, no targetv6/.
+COPY --from=build /build/target/orders-spring-app-1.0.0.jar app.jar
+COPY --from=build /build/target/otel-javaagent.jar otel-javaagent.jar
 
 # El agente OTEL se activa vía JAVA_TOOL_OPTIONS sin modificar el código
 # Las variables OTEL_* se inyectan en tiempo de ejecución (docker run -e o kubernetes env)

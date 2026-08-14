@@ -1,4 +1,4 @@
-package com.example.ordersapp.exception;
+package com.example.ordersapp.exceptions;
 
 public class ResourceNotFoundException extends RuntimeException {
 

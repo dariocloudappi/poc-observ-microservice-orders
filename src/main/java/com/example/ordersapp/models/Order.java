@@ -1,4 +1,4 @@
-package com.example.ordersapp.model;
+package com.example.ordersapp.models;
 
 import com.fasterxml.jackson.annotation.JsonFormat;
 import jakarta.persistence.*;

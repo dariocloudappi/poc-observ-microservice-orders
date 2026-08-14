@@ -1,4 +1,4 @@
-package com.example.ordersapp.controller;
+package com.example.ordersapp.controllers;
 
 import com.example.ordersapp.system.SystemService;
 import com.example.ordersapp.system.SystemStatusResponse;

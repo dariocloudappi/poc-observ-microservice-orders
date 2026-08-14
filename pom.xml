@@ -119,78 +119,17 @@
                 </executions>
             </plugin>
 
-            <!-- Plugin Azure App Service (opcional: despliegue directo con mvn azure-webapp:deploy) -->
-            <plugin>
-                <groupId>com.microsoft.azure</groupId>
-                <artifactId>azure-webapp-maven-plugin</artifactId>
-                <version>2.13.0</version>
-                <configuration>
-                    <schemaVersion>v2</schemaVersion>
-                    <subscriptionId>${env.AZURE_SUBSCRIPTION_ID}</subscriptionId>
-                    <resourceGroup>${env.AZURE_RESOURCE_GROUP}</resourceGroup>
-                    <appName>${env.AZURE_APP_NAME}</appName>
-                    <region>${env.AZURE_REGION}</region>
-                    <pricingTier>B2</pricingTier>
-                    <runtime>
-                        <os>Linux</os>
-                        <javaVersion>Java 17</javaVersion>
-                        <webContainer>Java SE</webContainer>
-                    </runtime>
-                    <deployment>
-                        <resources>
-                            <!-- Despliega el JAR de la app y el agente OTEL -->
-                            <resource>
-                                <directory>${project.build.directory}</directory>
-                                <includes>
-                                    <include>${project.artifactId}-${project.version}.jar</include>
-                                    <include>otel-javaagent.jar</include>
-                                </includes>
-                            </resource>
-                        </resources>
-                    </deployment>
-                    <appSettings>
-                        <!--
-                            JAVA_TOOL_OPTIONS activa el agente OTEL sin modificar código.
-                            El resto de variables se configuran en App Service > Configuration.
-                        -->
-                        <property>
-                            <name>JAVA_TOOL_OPTIONS</name>
-                            <value>-javaagent:/home/site/wwwroot/otel-javaagent.jar -Xmx512m</value>
-                        </property>
-                        <property>
-                            <name>OTEL_SERVICE_NAME</name>
-                            <value>orders-spring-app</value>
-                        </property>
-                        <property>
-                            <name>OTEL_EXPORTER_OTLP_PROTOCOL</name>
-                            <value>http/protobuf</value>
-                        </property>
-                        <property>
-                            <name>OTEL_LOGS_EXPORTER</name>
-                            <value>otlp</value>
-                        </property>
-                        <property>
-                            <name>OTEL_METRICS_EXPORTER</name>
-                            <value>otlp</value>
-                        </property>
-                        <property>
-                            <name>OTEL_TRACES_EXPORTER</name>
-                            <value>otlp</value>
-                        </property>
-                        <!-- Captura key-value pairs del API fluida SLF4J 2.x y atributos MDC.
-                             El level llega automaticamente como severityText; estas variables
-                             habilitan los campos adicionales (http.method, http.target, etc.) -->
-                        <property>
-                            <name>OTEL_INSTRUMENTATION_LOGBACK_APPENDER_EXPERIMENTAL_CAPTURE_KEY_VALUE_PAIR_ATTRIBUTES</name>
-                            <value>true</value>
-                        </property>
-                        <property>
-                            <name>OTEL_INSTRUMENTATION_LOGBACK_APPENDER_EXPERIMENTAL_CAPTURE_MDC_ATTRIBUTES</name>
-                            <value>*</value>
-                        </property>
-                    </appSettings>
-                </configuration>
-            </plugin>
+            <!--
+                El despliegue lo realiza el pipeline de GitHub Actions:
+                la infraestructura y los app settings los define infra/main.bicep
+                y el paquete se sube con "az webapp deploy".
+
+                El plugin azure-webapp-maven-plugin se ha retirado a proposito:
+                creaba su propio plan B2 y sobrescribia los app settings del
+                Bicep, dejando la aplicacion sin las variables de New Relic, sin
+                la cadena de conexion a la base de datos y sin la URL del
+                servicio de usuarios.
+            -->
         </plugins>
     </build>
 </project>

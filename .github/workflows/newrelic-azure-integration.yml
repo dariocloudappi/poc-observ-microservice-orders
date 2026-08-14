@@ -1,0 +1,313 @@
+# =============================================================================
+# newrelic-azure-integration.yml
+# -----------------------------------------------------------------------------
+# One time, subscription wide setup of the New Relic Azure integration
+# (polling). It provisions everything New Relic asks for in its documentation:
+#
+#   - an Entra ID application, the intermediary New Relic uses to read Azure
+#   - its service principal
+#   - the "Reader" and "Monitoring Reader" roles at subscription scope
+#   - the microsoft.insights resource provider registered
+#   - a client secret, which New Relic requires and which expires
+#
+# Everything is idempotent: if the application already exists it is reused, and
+# roles that are already assigned are left alone. Running it twice changes
+# nothing (unless rotate_secret is set on purpose).
+#
+# The resulting values are stored as GitHub environment secrets so they are not
+# lost: the client secret cannot be read back from Azure once created.
+#
+# This workflow needs more permissions than deploy.yml. See the README.
+#
+# WARNING: do not combine this with the Azure Native New Relic Service
+# (workflow newrelic-native-integration). Both send the same platform metrics
+# to the same New Relic account, so running the two duplicates the data and its
+# ingest cost. The native service is the recommended path: it also brings logs
+# and needs no client secret. Use this polling integration only if the native
+# service is not an option in your tenant.
+# =============================================================================
+
+name: newrelic-azure-integration
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_display_name:
+        description: 'Display name of the Entra ID application shared by every PoC. Reused if it already exists'
+        required: false
+        default: 'NewRelic-Integrations'
+      environment_name:
+        description: 'GitHub environment where the resulting values are stored'
+        required: false
+        default: 'newrelic'
+      rotate_secret:
+        description: 'Create a new client secret even if the application already has one'
+        required: false
+        default: 'false'
+      secret_years:
+        description: 'Lifetime of the client secret in years (Azure allows up to 2)'
+        required: false
+        default: '1'
+      store_in_github:
+        description: 'Store the values as GitHub secrets. Needs the GH_ADMIN_TOKEN secret'
+        required: false
+        default: 'true'
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: newrelic-azure-integration
+  cancel-in-progress: false
+
+jobs:
+
+  configure:
+    name: Configure the New Relic Azure integration
+    runs-on: ubuntu-latest
+    steps:
+
+      # Fail before touching Azure if the job cannot finish its work, so a
+      # client secret is never created and then lost.
+      - name: Check the inputs
+        env:
+          GH_ADMIN_TOKEN: ${{ secrets.GH_ADMIN_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.store_in_github }}" = "true" ] && [ -z "${GH_ADMIN_TOKEN}" ]; then
+            echo "ERROR: store_in_github is true but the GH_ADMIN_TOKEN secret is not set." >&2
+            echo "GITHUB_TOKEN cannot write secrets, so a PAT with rights over" >&2
+            echo "Environments and Secrets of this repository is required." >&2
+            echo "Set store_in_github=false to only print what has to be configured." >&2
+            exit 1
+          fi
+          if [ "${{ inputs.secret_years }}" != "1" ] && [ "${{ inputs.secret_years }}" != "2" ]; then
+            echo "ERROR: secret_years must be 1 or 2" >&2
+            exit 1
+          fi
+
+      - name: Azure login with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # New Relic reads metrics through Azure Monitor, which needs this
+      # provider registered on the subscription.
+      - name: Register the microsoft.insights provider
+        run: |
+          set -euo pipefail
+          state=$(az provider show --namespace microsoft.insights --query registrationState -o tsv 2>/dev/null || echo "NotRegistered")
+          if [ "$state" != "Registered" ]; then
+            echo "Registering microsoft.insights (current state: ${state}) ..."
+            az provider register --namespace microsoft.insights --wait
+          fi
+          az provider show --namespace microsoft.insights --query "{namespace:namespace,state:registrationState}" -o table
+
+      # ---------------------------------------------------------------------
+      # The intermediary application
+      # ---------------------------------------------------------------------
+      - name: Find or create the Entra ID application
+        id: app
+        env:
+          APP_NAME: ${{ inputs.app_display_name }}
+        run: |
+          set -euo pipefail
+
+          # --display-name filters by prefix, so the exact name is matched here.
+          app_id=$(az ad app list --display-name "$APP_NAME" \
+            --query "[?displayName=='${APP_NAME}'].appId | [0]" -o tsv 2>/dev/null || true)
+
+          if [ -n "$app_id" ] && [ "$app_id" != "null" ]; then
+            echo "Application '${APP_NAME}' already exists, reusing it."
+            created=false
+          else
+            echo "Creating the application '${APP_NAME}' ..."
+            if ! app_id=$(az ad app create --display-name "$APP_NAME" \
+                  --sign-in-audience AzureADMyOrg \
+                  --web-home-page-url "https://newrelic.com" \
+                  --query appId -o tsv); then
+              echo "ERROR: could not create the application." >&2
+              echo "The identity running this workflow needs the Application Developer" >&2
+              echo "directory role, or the Application.ReadWrite.All Graph permission." >&2
+              exit 1
+            fi
+            created=true
+          fi
+
+          # The service principal is what actually receives the role assignments.
+          if ! sp_object_id=$(az ad sp show --id "$app_id" --query id -o tsv 2>/dev/null); then
+            echo "Creating the service principal ..."
+            sp_object_id=$(az ad sp create --id "$app_id" --query id -o tsv)
+          fi
+
+          echo "app_id=${app_id}" >> "$GITHUB_OUTPUT"
+          echo "sp_object_id=${sp_object_id}" >> "$GITHUB_OUTPUT"
+          echo "created=${created}" >> "$GITHUB_OUTPUT"
+          echo "Application (client) id: ${app_id}"
+
+      # ---------------------------------------------------------------------
+      # Roles required by New Relic, both at subscription scope
+      # ---------------------------------------------------------------------
+      - name: Assign Reader and Monitoring Reader
+        env:
+          SP_OBJECT_ID: ${{ steps.app.outputs.sp_object_id }}
+        run: |
+          set -euo pipefail
+          sub_id=$(az account show --query id -o tsv)
+          scope="/subscriptions/${sub_id}"
+
+          for role in "Reader" "Monitoring Reader"; do
+            existing=$(az role assignment list \
+              --assignee "$SP_OBJECT_ID" \
+              --role "$role" \
+              --scope "$scope" \
+              --query "[].id" -o tsv 2>/dev/null || true)
+
+            if [ -n "$existing" ]; then
+              echo "Role '${role}' is already assigned at subscription scope."
+              continue
+            fi
+
+            echo "Assigning '${role}' at ${scope} ..."
+            if ! az role assignment create \
+                  --assignee-object-id "$SP_OBJECT_ID" \
+                  --assignee-principal-type ServicePrincipal \
+                  --role "$role" \
+                  --scope "$scope" \
+                  --output none; then
+              echo "ERROR: could not assign '${role}'." >&2
+              echo "The identity running this workflow needs Owner or" >&2
+              echo "Role Based Access Control Administrator on the subscription." >&2
+              exit 1
+            fi
+          done
+
+          echo "Effective assignments:"
+          az role assignment list --assignee "$SP_OBJECT_ID" --scope "$scope" \
+            --query "[].{role:roleDefinitionName,scope:scope}" -o table
+
+      # ---------------------------------------------------------------------
+      # Client secret. New Relic has no passwordless option for this
+      # integration, so the secret is unavoidable.
+      # ---------------------------------------------------------------------
+      - name: Create or reuse the client secret
+        id: secret
+        env:
+          APP_ID: ${{ steps.app.outputs.app_id }}
+          ROTATE: ${{ inputs.rotate_secret }}
+          YEARS: ${{ inputs.secret_years }}
+        run: |
+          set -euo pipefail
+
+          existing_count=$(az ad app credential list --id "$APP_ID" --query "length(@)" -o tsv)
+          echo "The application currently has ${existing_count} credential(s)."
+
+          if [ "$existing_count" -gt 0 ] && [ "$ROTATE" != "true" ]; then
+            # An existing secret cannot be read back, so nothing is emitted.
+            echo "secret_created=false" >> "$GITHUB_OUTPUT"
+            echo "A client secret already exists and its value cannot be read back."
+            echo "Run this workflow again with rotate_secret=true if you need a new one."
+            exit 0
+          fi
+
+          echo "Creating a client secret valid for ${YEARS} year(s) ..."
+          # --append keeps the credentials already in place, so rotating does
+          # not break an integration that is already running.
+          secret=$(az ad app credential reset \
+            --id "$APP_ID" \
+            --years "$YEARS" \
+            --append \
+            --display-name "newrelic-integration-${GITHUB_RUN_ID}" \
+            --query password -o tsv)
+
+          echo "::add-mask::${secret}"
+          echo "secret_created=true" >> "$GITHUB_OUTPUT"
+          echo "client_secret=${secret}" >> "$GITHUB_OUTPUT"
+          echo "Client secret created. It is masked in the logs and never printed."
+
+      # ---------------------------------------------------------------------
+      # Store the values in GitHub so the client secret is not lost
+      # ---------------------------------------------------------------------
+      - name: Store the values in a GitHub environment
+        if: ${{ inputs.store_in_github == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GH_ADMIN_TOKEN }}
+          ENV_NAME: ${{ inputs.environment_name }}
+          APP_ID: ${{ steps.app.outputs.app_id }}
+          SECRET_CREATED: ${{ steps.secret.outputs.secret_created }}
+          CLIENT_SECRET: ${{ steps.secret.outputs.client_secret }}
+        run: |
+          set -euo pipefail
+          tenant_id=$(az account show --query tenantId -o tsv)
+          sub_id=$(az account show --query id -o tsv)
+
+          target="env"
+          if gh api -X PUT "repos/${GITHUB_REPOSITORY}/environments/${ENV_NAME}" --silent 2>/dev/null; then
+            echo "GitHub environment '${ENV_NAME}' ready."
+          else
+            # Environments in private repositories need a paid plan. Falling
+            # back to repository level secrets keeps the workflow usable.
+            echo "WARNING: could not create the environment (private repository on a free plan?)."
+            echo "Falling back to repository level secrets."
+            target="repo"
+          fi
+
+          set_secret() {
+            if [ "$target" = "env" ]; then
+              gh secret set "$1" --env "$ENV_NAME" --body "$2" --repo "$GITHUB_REPOSITORY"
+            else
+              gh secret set "$1" --body "$2" --repo "$GITHUB_REPOSITORY"
+            fi
+            echo "  stored secret $1"
+          }
+
+          set_secret NR_AZURE_CLIENT_ID "$APP_ID"
+          set_secret NR_AZURE_TENANT_ID "$tenant_id"
+          set_secret NR_AZURE_SUBSCRIPTION_ID "$sub_id"
+
+          if [ "$SECRET_CREATED" = "true" ]; then
+            set_secret NR_AZURE_CLIENT_SECRET "$CLIENT_SECRET"
+          else
+            echo "  client secret not rotated in this run, the stored one is kept"
+          fi
+
+      - name: What to do next in New Relic
+        if: always()
+        env:
+          APP_ID: ${{ steps.app.outputs.app_id }}
+          SECRET_CREATED: ${{ steps.secret.outputs.secret_created }}
+          ENV_NAME: ${{ inputs.environment_name }}
+        run: |
+          set -euo pipefail
+          tenant_id=$(az account show --query tenantId -o tsv 2>/dev/null || echo "unknown")
+          sub_id=$(az account show --query id -o tsv 2>/dev/null || echo "unknown")
+
+          {
+            echo "## New Relic Azure integration"
+            echo
+            echo "| Value | Where it is |"
+            echo "|-------|-------------|"
+            echo "| Subscription ID | \`${sub_id}\` |"
+            echo "| Tenant ID | \`${tenant_id}\` |"
+            echo "| Application (client) ID | \`${APP_ID}\` |"
+            if [ "${SECRET_CREATED}" = "true" ]; then
+              echo "| Client secret | stored as the \`NR_AZURE_CLIENT_SECRET\` secret (environment \`${ENV_NAME}\`) |"
+            else
+              echo "| Client secret | not rotated in this run. Re-run with \`rotate_secret=true\` if you do not have it |"
+            fi
+            echo
+            echo "Roles \`Reader\` and \`Monitoring Reader\` are assigned at subscription scope,"
+            echo "and the \`microsoft.insights\` provider is registered."
+            echo
+            echo "### Last step, in the New Relic UI"
+            echo
+            echo "1. Go to **one.newrelic.com > Infrastructure > Azure > Add an Azure account**."
+            echo "2. Paste the four values above."
+            echo "3. Wait for the first polling cycle (up to 5 minutes for most services)."
+            echo
+            echo "The client secret expires. Re-run this workflow with \`rotate_secret=true\`"
+            echo "before the expiry date and update the value in New Relic."
+          } >> "$GITHUB_STEP_SUMMARY"

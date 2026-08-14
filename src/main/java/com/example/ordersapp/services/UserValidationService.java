@@ -1,9 +1,9 @@
-package com.example.ordersapp.service;
+package com.example.ordersapp.services;
 
-import com.example.ordersapp.client.dto.UserDto;
-import com.example.ordersapp.client.dto.UserSingleEnvelope;
-import com.example.ordersapp.exception.UserNotFoundException;
-import com.example.ordersapp.exception.UsersServiceUnavailableException;
+import com.example.ordersapp.client.dtos.UserDto;
+import com.example.ordersapp.client.dtos.UserSingleEnvelope;
+import com.example.ordersapp.exceptions.UserNotFoundException;
+import com.example.ordersapp.exceptions.UsersServiceUnavailableException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;

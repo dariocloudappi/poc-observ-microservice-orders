@@ -1,4 +1,4 @@
-package com.example.ordersapp.filter;
+package com.example.ordersapp.filters;
 
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
@@ -38,18 +38,24 @@ public class RequestLoggingFilter extends OncePerRequestFilter {
                                     FilterChain filterChain) throws ServletException, IOException {
         long start = System.currentTimeMillis();
 
-        MDC.put("http.method", request.getMethod());
-        MDC.put("http.target", request.getRequestURI());
+        String method = request.getMethod();
+        String path = request.getRequestURI();
+
+        MDC.put("http.method", method);
+        MDC.put("http.target", path);
         MDC.put("http.client_ip", request.getRemoteAddr());
         MDC.put("user_agent", request.getHeader("User-Agent") != null ? request.getHeader("User-Agent") : "");
 
+        // El metodo y la ruta viajan dos veces a proposito: dentro del mensaje,
+        // para que sea legible tal cual, y como atributos estructurados, que son
+        // los que permiten filtrar y agrupar en New Relic.
         log.atInfo()
-                .addKeyValue("http.method", request.getMethod())
-                .addKeyValue("http.target", request.getRequestURI())
+                .addKeyValue("http.method", method)
+                .addKeyValue("http.target", path)
                 .addKeyValue("http.query", request.getQueryString() != null ? request.getQueryString() : "")
                 .addKeyValue("http.client_ip", request.getRemoteAddr())
                 .addKeyValue("http.headers", safeHeaders(request).toString())
-                .log("Starting request");
+                .log("{} Starting request {}", method, path);
 
         try {
             filterChain.doFilter(request, response);
@@ -59,11 +65,11 @@ public class RequestLoggingFilter extends OncePerRequestFilter {
             MDC.put("http.duration_ms", String.valueOf(duration));
 
             log.atInfo()
-                    .addKeyValue("http.method", request.getMethod())
-                    .addKeyValue("http.target", request.getRequestURI())
+                    .addKeyValue("http.method", method)
+                    .addKeyValue("http.target", path)
                     .addKeyValue("http.status_code", response.getStatus())
                     .addKeyValue("http.duration_ms", duration)
-                    .log("Ending request");
+                    .log("{} Ending request {} {} (ms)", method, path, duration);
 
             MDC.clear();
         }

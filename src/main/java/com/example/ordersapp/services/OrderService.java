@@ -1,8 +1,8 @@
-package com.example.ordersapp.service;
+package com.example.ordersapp.services;
 
-import com.example.ordersapp.exception.ResourceNotFoundException;
-import com.example.ordersapp.model.Order;
-import com.example.ordersapp.model.OrderStatus;
+import com.example.ordersapp.exceptions.ResourceNotFoundException;
+import com.example.ordersapp.models.Order;
+import com.example.ordersapp.models.OrderStatus;
 import com.example.ordersapp.repository.OrderRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;

@@ -1,9 +1,9 @@
- package com.example.ordersapp.controller;
+ package com.example.ordersapp.controllers;
 
-import com.example.ordersapp.model.Order;
-import com.example.ordersapp.model.OrderStatus;
-import com.example.ordersapp.service.OrderService;
-import com.example.ordersapp.service.UserValidationService;
+import com.example.ordersapp.models.Order;
+import com.example.ordersapp.models.OrderStatus;
+import com.example.ordersapp.services.OrderService;
+import com.example.ordersapp.services.UserValidationService;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;

@@ -1,4 +1,4 @@
-package com.example.ordersapp.exception;
+package com.example.ordersapp.exceptions;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
