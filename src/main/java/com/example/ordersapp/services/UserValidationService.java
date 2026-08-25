@@ -1,6 +1,7 @@
 package com.example.ordersapp.services;
 
 import com.example.ordersapp.client.dtos.UserDto;
+import com.example.ordersapp.config.OutboundHttpLoggingInterceptor;
 import com.example.ordersapp.client.dtos.UserSingleEnvelope;
 import com.example.ordersapp.exceptions.UserNotFoundException;
 import com.example.ordersapp.exceptions.UsersServiceUnavailableException;
@@ -10,6 +11,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.web.client.RestTemplateBuilder;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.client.BufferingClientHttpRequestFactory;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.HttpClientErrorException;
@@ -22,27 +24,48 @@ public class UserValidationService {
 
     private static final Logger log = LoggerFactory.getLogger(UserValidationService.class);
     private final RestTemplate restTemplate;
-    private final String usersServiceUrl;
 
+    /** Base de la API de usuarios TAL COMO SE PUBLICA en el gateway. */
+    private final String usersApiBaseUrl;
+
+    /**
+     * Las llamadas NO van directas a la Web App de microservice-users: van al
+     * gateway de Tyk, que las enruta. De ahi que la url sea la del gateway mas
+     * el listen path de la API de usuarios, y que las credenciales sean las de
+     * CONSUMIDOR del gateway, no el Basic Auth del microservicio.
+     *
+     * Tyk sustituye la cabecera Authorization por la del upstream antes de
+     * reenviar, asi que este servicio nunca conoce la credencial de users.
+     */
     public UserValidationService(
             RestTemplateBuilder builder,
-            @Value("${users.service.url}") String url,
-            @Value("${users.service.username}") String username,
-            @Value("${users.service.password}") String password) {
+            @Value("${gateway.url}") String gatewayUrl,
+            @Value("${gateway.users-path}") String usersPath,
+            @Value("${gateway.username}") String username,
+            @Value("${gateway.password}") String password) {
         this.restTemplate = builder
                 .basicAuthentication(username, password)
                 .requestFactory(() -> {
                     SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
                     factory.setConnectTimeout((int) Duration.ofSeconds(3).toMillis());
                     factory.setReadTimeout((int) Duration.ofSeconds(5).toMillis());
-                    return factory;
+                    // Buffering para que el interceptor pueda leer el cuerpo sin
+                    // consumirlo. Aqui los cuerpos no se registran, pero el
+                    // wrapper deja la puerta abierta sin romper nada.
+                    return new BufferingClientHttpRequestFactory(factory);
                 })
+                // logBodies en FALSE a proposito: la respuesta de este servicio
+                // trae nombre y email de una persona. Se registran la url, el
+                // codigo y la duracion, nunca el payload. La cabecera
+                // Authorization tampoco se registra, va en SENSITIVE_HEADERS.
+                .additionalInterceptors(new OutboundHttpLoggingInterceptor("tyk-gateway", false))
                 .build();
-        this.usersServiceUrl = url;
+        // Se normaliza aqui una sola vez para no repetir la concatenacion.
+        this.usersApiBaseUrl = trimSlash(gatewayUrl) + "/" + usersPath.replaceAll("^/+", "");
     }
 
     public UserDto validateUser(String userId) {
-        String endpoint = usersServiceUrl + "/users/" + userId;
+        String endpoint = usersApiBaseUrl + "/users/" + userId;
         log.debug("Validando usuario {} contra {}", userId, endpoint);
         try {
             ResponseEntity<UserSingleEnvelope> response =
@@ -70,7 +93,12 @@ public class UserValidationService {
         return restTemplate;
     }
 
-    public String getUsersServiceUrl() {
-        return usersServiceUrl;
+    /** Base de la API de usuarios a traves del gateway, sin barra final. */
+    public String getUsersApiBaseUrl() {
+        return usersApiBaseUrl;
+    }
+
+    private static String trimSlash(String value) {
+        return value.endsWith("/") ? value.substring(0, value.length() - 1) : value;
     }
 }

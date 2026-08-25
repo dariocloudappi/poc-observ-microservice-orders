@@ -43,12 +43,13 @@ param sqlDatabaseName = readEnvironmentVariable('SQL_DATABASE_NAME', 'sqldb-orde
 param sqlAdminUser = readEnvironmentVariable('SQL_ADMIN_USER', '')
 param sqlAdminPassword = readEnvironmentVariable('SQL_ADMIN_PASSWORD', '')
 
-param apiUser = readEnvironmentVariable('API_USERNAME', '')
-param apiPassword = readEnvironmentVariable('API_PASSWORD', '')
+param basicAuthUser = readEnvironmentVariable('BASIC_AUTH_USER', '')
+param basicAuthPassword = readEnvironmentVariable('BASIC_AUTH_PASSWORD', '')
 
-param usersServiceUrl = readEnvironmentVariable('USERS_SERVICE_URL', '')
-param usersServiceUser = readEnvironmentVariable('USERS_SERVICE_USERNAME', '')
-param usersServicePassword = readEnvironmentVariable('USERS_SERVICE_PASSWORD', '')
+param gatewayBaseUrl = readEnvironmentVariable('GATEWAY_BASE_URL', '')
+param gatewayUsersPath = readEnvironmentVariable('GATEWAY_USERS_PATH', '/api-users/v1')
+param gatewayBasicUser = readEnvironmentVariable('GATEWAY_BASIC_USER', '')
+param gatewayBasicPassword = readEnvironmentVariable('GATEWAY_BASIC_PASSWORD', '')
 
 param newRelicLicenseKey = readEnvironmentVariable('NR_LICENSE_KEY', '')
 param newRelicOtlpEndpoint = readEnvironmentVariable('NR_OTLP_ENDPOINT', 'https://otlp.eu01.nr-data.net:4318')

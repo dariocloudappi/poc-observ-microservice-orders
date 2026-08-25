@@ -15,8 +15,24 @@
 
 targetScope = 'subscription'
 
-@description('Azure region for the monitor resource')
+@description('Region of the resource group that holds the monitor. Only metadata: it does not have to match the region of the monitor itself')
 param location string = 'westeurope'
+
+// Region of the monitor resource, deliberately independent from the region of
+// the PoC. The type NewRelic.Observability/monitors is NOT available in every
+// region: deploying it in westeurope fails with
+// LocationNotAvailableForResourceType. It does not matter for coverage, because
+// the tag rules apply to the WHOLE subscription regardless of where the monitor
+// lives.
+//
+// The deploy workflow resolves a valid region on its own. To check the list by
+// hand (the JMESPath needs quotes, which is why this is a comment and not part
+// of the @description string):
+//
+//   az provider show --namespace NewRelic.Observability \
+//     --query "resourceTypes[?resourceType=='monitors'].locations" -o json
+@description('Region of the New Relic monitor resource. Not every region offers this resource type, see the comment above')
+param monitorLocation string = 'eastus'
 
 @description('Resource group that holds the New Relic monitor. It must survive the destroy workflow of the PoC')
 param resourceGroupName string = 'rg-newrelic-shared'
@@ -80,7 +96,9 @@ module monitor './modules/newrelic-monitor.bicep' = {
   name: 'newrelic-monitor'
   scope: rg
   params: {
-    location: location
+    // Deliberadamente monitorLocation y no location: el tipo de recurso solo
+    // existe en algunas regiones, y el resource group puede estar en otra.
+    location: monitorLocation
     monitorName: monitorName
     tags: tags
     newRelicAccountId: newRelicAccountId
@@ -100,3 +118,4 @@ module monitor './modules/newrelic-monitor.bicep' = {
 output resourceGroupName string = rg.name
 output monitorName string = monitor.outputs.monitorName
 output monitorId string = monitor.outputs.monitorId
+output monitorLocation string = monitorLocation

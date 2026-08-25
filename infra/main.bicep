@@ -110,22 +110,28 @@ param sqlAdminPassword string
 
 @description('Basic Auth user accepted by this API')
 @secure()
-param apiUser string
+param basicAuthUser string
 
 @description('Basic Auth password accepted by this API')
 @secure()
-param apiPassword string
+param basicAuthPassword string
 
-@description('Base url of the users microservice, without trailing slash')
-param usersServiceUrl string
+// Este servicio NO llama a la Web App de users: llama al gateway de Tyk, que
+// enruta. De ahi que la url sea la del gateway y las credenciales las de
+// consumidor del gateway.
+@description('Base url of the Tyk gateway, without trailing slash. Empty on the first deployment: the gateway cannot exist until orders exists, so the app deploys and the order endpoints answer 503 until it is set')
+param gatewayBaseUrl string = ''
 
-@description('Basic Auth user presented to the users microservice')
+@description('Listen path with which the gateway publishes the users API')
+param gatewayUsersPath string = '/api-users/v1'
+
+@description('Gateway consumer user. NOT the Basic Auth of microservice-users: Tyk swaps the header before forwarding upstream')
 @secure()
-param usersServiceUser string
+param gatewayBasicUser string
 
-@description('Basic Auth password presented to the users microservice')
+@description('Gateway consumer password')
 @secure()
-param usersServicePassword string
+param gatewayBasicPassword string
 
 @description('New Relic ingest license key')
 @secure()
@@ -222,11 +228,12 @@ module app './modules/appservice.bicep' = {
     sqlDatabaseName: sql.outputs.databaseName
     sqlAdminUser: sqlAdminUser
     sqlAdminPassword: sqlAdminPassword
-    apiUser: apiUser
-    apiPassword: apiPassword
-    usersServiceUrl: usersServiceUrl
-    usersServiceUser: usersServiceUser
-    usersServicePassword: usersServicePassword
+    basicAuthUser: basicAuthUser
+    basicAuthPassword: basicAuthPassword
+    gatewayBaseUrl: gatewayBaseUrl
+    gatewayUsersPath: gatewayUsersPath
+    gatewayBasicUser: gatewayBasicUser
+    gatewayBasicPassword: gatewayBasicPassword
     newRelicLicenseKey: newRelicLicenseKey
     newRelicOtlpEndpoint: newRelicOtlpEndpoint
     observabilityEnabled: observabilityEnabled

@@ -101,11 +101,23 @@ resource database 'Microsoft.Sql/servers/databases@2023-08-01-preview' = {
 }
 
 // Azure Monitor: query performance, errors, timeouts, deadlocks and blocks.
-resource databaseDiagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' = if (enableLogAnalytics) {
+//
+// The condition includes enableSqlAudit on purpose. This setting is also the
+// sink of the audit trail, because allLogs carries SQLSecurityAuditEvents, so
+// turning Log Analytics off while auditing is on would leave the audit with no
+// destination and it would fail silently, which is exactly the failure mode the
+// Azure documentation warns about.
+resource databaseDiagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' = if (enableLogAnalytics || enableSqlAudit) {
   name: 'diag-${databaseName}'
   scope: database
   properties: {
     workspaceId: logAnalyticsWorkspaceId
+    // Tablas dedicadas. El valor por defecto es AzureDiagnostics, y con el TODO
+    // acaba en la tabla generica AzureDiagnostics: la tabla
+    // SQLSecurityAuditEvents se queda vacia y las columnas pierden su nombre
+    // (Statement pasa a statement_s, ClientIp a client_ip_s...). Sin esta linea
+    // la auditoria se genera pero no se puede consultar como esta documentado.
+    logAnalyticsDestinationType: 'Dedicated'
     logs: [
       {
         categoryGroup: 'allLogs'
@@ -137,11 +149,15 @@ resource databaseDiagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-01-p
 //
 // isAzureMonitorTargetEnabled routes the records to the diagnostic settings
 // instead of to a storage account, which is what keeps this free of extra
-// resources. The category SQLSecurityAuditEvents already travels inside the
-// allLogs group above, but it stays silent until this policy exists.
+// resources.
 //
 // It depends on the diagnostic setting on purpose: with Azure Monitor as the
 // target, the destination has to be in place before auditing is turned on.
+// A single setting with categoryGroup allLogs already carries the
+// SQLSecurityAuditEvents category: Azure itself proves it, because declaring a
+// second setting with that category towards the same workspace is rejected with
+// "Data sinks can't be reused in different settings on the same category for the
+// same resource".
 resource databaseAuditing 'Microsoft.Sql/servers/databases/auditingSettings@2023-08-01-preview' = if (enableSqlAudit) {
   parent: database
   name: 'default'

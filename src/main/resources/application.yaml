@@ -24,16 +24,30 @@ spring:
       hibernate:
         dialect: org.hibernate.dialect.SQLServerDialect
 
-users:
-  service:
-    url: ${USERS_SERVICE_URL:http://localhost:8081}
-    username: ${USERS_SERVICE_USERNAME:admin}
-    password: ${USERS_SERVICE_PASSWORD:password}
+# Como alcanza este servicio la API de usuarios: NO directamente, sino a traves
+# del gateway de Tyk. Estas son las variables propias de orders.
+gateway:
+  # Base del gateway, sin barra final. Sin valor por defecto util en Azure: el
+  # FQDN de Container Apps no es predecible, hay que pasarlo.
+  url: ${GATEWAY_BASE_URL:https://localhost:8443}
+  # Listen path con el que el gateway publica la API de usuarios.
+  users-path: ${GATEWAY_USERS_PATH:/api-users/v1}
+  # Credenciales de CONSUMIDOR del gateway, no el Basic Auth de users: Tyk
+  # sustituye la cabecera antes de reenviar al upstream. Sin valor por defecto,
+  # por el mismo motivo que en app.security.
+  username: ${GATEWAY_BASIC_USER}
+  password: ${GATEWAY_BASIC_PASSWORD}
 
-api:
+app:
   security:
-    username: ${API_USERNAME:admin}
-    password: ${API_PASSWORD:password}
+    # Credenciales que ESTE servicio exige a quien le llama. Mismo nombre que en
+    # microservice-users, a proposito: es el mismo concepto en los dos.
+    #
+    # SIN valor por defecto. Con ${BASIC_AUTH_USER:admin} el servicio arrancaba
+    # con admin/password si la variable faltaba, en lugar de fallar, y un
+    # despliegue incompleto quedaba abierto con una credencial conocida.
+    username: ${BASIC_AUTH_USER}
+    password: ${BASIC_AUTH_PASSWORD}
 
 server:
   port: ${PORT:8080}

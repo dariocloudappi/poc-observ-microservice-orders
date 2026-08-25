@@ -26,19 +26,22 @@ param sqlAdminUser string
 param sqlAdminPassword string
 
 @secure()
-param apiUser string
+param basicAuthUser string
 
 @secure()
-param apiPassword string
+param basicAuthPassword string
 
-// This service calls the users microservice to validate the owner of an order.
-param usersServiceUrl string
+// This service validates the owner of an order THROUGH the Tyk gateway, not by
+// calling the users Web App directly.
+param gatewayBaseUrl string
+
+param gatewayUsersPath string = '/api-users/v1'
 
 @secure()
-param usersServiceUser string
+param gatewayBasicUser string
 
 @secure()
-param usersServicePassword string
+param gatewayBasicPassword string
 
 @secure()
 param newRelicLicenseKey string
@@ -102,7 +105,7 @@ var platformSettings = [
     value: logLevel
   }
   {
-    // Read by application.yml as the level of the org.hibernate.SQL logger.
+    // Read by application.yaml as the level of the org.hibernate.SQL logger.
     // Set it to DEBUG to ship every executed statement as a log record, which
     // travels to New Relic through the Logback instrumentation of the agent.
     // It is NOT named LOGGING_LEVEL_ORG_HIBERNATE_SQL because Spring Boot
@@ -145,28 +148,32 @@ var databaseSettings = [
 
 var securitySettings = [
   {
-    name: 'API_USERNAME'
-    value: apiUser
+    name: 'BASIC_AUTH_USER'
+    value: basicAuthUser
   }
   {
-    name: 'API_PASSWORD'
-    value: apiPassword
+    name: 'BASIC_AUTH_PASSWORD'
+    value: basicAuthPassword
   }
 ]
 
-// Downstream dependency: the users microservice.
-var usersServiceSettings = [
+// Downstream dependency: the Tyk gateway, which routes to microservice-users.
+var gatewaySettings = [
   {
-    name: 'USERS_SERVICE_URL'
-    value: usersServiceUrl
+    name: 'GATEWAY_BASE_URL'
+    value: gatewayBaseUrl
   }
   {
-    name: 'USERS_SERVICE_USERNAME'
-    value: usersServiceUser
+    name: 'GATEWAY_USERS_PATH'
+    value: gatewayUsersPath
   }
   {
-    name: 'USERS_SERVICE_PASSWORD'
-    value: usersServicePassword
+    name: 'GATEWAY_BASIC_USER'
+    value: gatewayBasicUser
+  }
+  {
+    name: 'GATEWAY_BASIC_PASSWORD'
+    value: gatewayBasicPassword
   }
 ]
 
@@ -259,6 +266,35 @@ var otelEnabledSettings = [
     value: 'application'
   }
   // ---------------------------------------------------------------------
+  // HTTP headers on the spans
+  // ---------------------------------------------------------------------
+  // The agent can put selected headers on the span as attributes
+  // http.request.header.<name> and http.response.header.<name>. It never
+  // captures bodies: that is not part of the OTel HTTP conventions and no
+  // setting enables it, so the payloads are logged by the application in
+  // OutboundHttpLoggingInterceptor when the destination is safe.
+  //
+  // authorization is deliberately absent from every list: the outbound call to
+  // the users microservice carries a real credential in it. traceparent IS
+  // included on purpose, because it is what makes the distributed trace between
+  // orders and users visible.
+  {
+    name: 'OTEL_INSTRUMENTATION_HTTP_SERVER_CAPTURE_REQUEST_HEADERS'
+    value: 'content-type,user-agent,x-forwarded-for,traceparent'
+  }
+  {
+    name: 'OTEL_INSTRUMENTATION_HTTP_SERVER_CAPTURE_RESPONSE_HEADERS'
+    value: 'content-type,x-trace-id'
+  }
+  {
+    name: 'OTEL_INSTRUMENTATION_HTTP_CLIENT_CAPTURE_REQUEST_HEADERS'
+    value: 'content-type,user-agent,traceparent'
+  }
+  {
+    name: 'OTEL_INSTRUMENTATION_HTTP_CLIENT_CAPTURE_RESPONSE_HEADERS'
+    value: 'content-type,server'
+  }
+  // ---------------------------------------------------------------------
   // Database telemetry over OTLP
   // ---------------------------------------------------------------------
   {
@@ -305,7 +341,7 @@ var appSettings = concat(
   platformSettings,
   databaseSettings,
   securitySettings,
-  usersServiceSettings,
+  gatewaySettings,
   observabilityEnabled ? otelEnabledSettings : otelDisabledSettings
 )
 
@@ -445,6 +481,10 @@ resource siteDiagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-01-previ
   scope: site
   properties: {
     workspaceId: logAnalyticsWorkspaceId
+    // Tablas dedicadas: AppServiceHTTPLogs, AppServiceConsoleLogs,
+    // AppServiceAppLogs, AppServicePlatformLogs. Sin esto todo cae en la tabla
+    // generica AzureDiagnostics y esas tablas salen vacias.
+    logAnalyticsDestinationType: 'Dedicated'
     logs: [
       {
         categoryGroup: 'allLogs'

@@ -12,7 +12,11 @@ secrets) y dimensionado para el mínimo coste posible en un PoC de vida corta.
 
 > **Este servicio depende de `microservice-users`.** Todos los endpoints de pedidos validan
 > primero el usuario contra ese servicio. Despliega `poc-microservice-users` **antes** y
-> configura aquí la variable `USERS_SERVICE_URL`.
+> configura aquí la variable `GATEWAY_BASE_URL`.
+>
+> **Y la llamada no es directa: va a través del gateway de Tyk.** Eso crea un ciclo en el
+> arranque del PoC, porque el gateway necesita la URL de orders para enrutar. Se rompe
+> desplegando orders dos veces, ver [10.1](#101-orden-correcto).
 
 | Si quieres... | Ve a |
 |---------------|------|
@@ -88,7 +92,7 @@ src/main/java/com/example/ordersapp/
 └── system/         SystemService y su respuesta de /status
 
 src/main/resources/
-├── application.yml     Configuración por variables de entorno
+├── application.yaml     Configuración por variables de entorno
 ├── database.sql        Esquema idempotente que aplica el pipeline
 └── logback-spring.xml
 
@@ -101,7 +105,6 @@ infra/
 
 .github/workflows/
 ├── deploy.yml                      Build, infra, esquema, despliegue y smoke tests
-├── destroy.yml                     Borrado manual y limpieza programada
 ├── newrelic-native-integration.yml Integración nativa de Azure con New Relic
 └── newrelic-azure-integration.yml  Integración de métricas de Azure por polling
 
@@ -111,7 +114,7 @@ startup.sh      Startup command de App Service: adjunta el agente si el jar est�
 ```
 
 Salvo los nombres (`ordersvc`, `sqldb-orders`, `microservice-orders`) y lo propio de este
-servicio (las credenciales `API_*`, la dependencia `USERS_SERVICE_*` y el paso de esquema), la
+servicio (las credenciales de entrada, la dependencia `GATEWAY_*` y el paso de esquema), la
 infraestructura es **la misma** que en `poc-microservice-users`: `monitoring.bicep`, `sql.bicep`
 y los tres ficheros de la integración nativa de New Relic son idénticos fichero a fichero.
 
@@ -126,20 +129,20 @@ APP=$(az webapp list -g rg-ordersvc --query "[0].name" -o tsv)
 URL="https://$(az webapp show -g rg-ordersvc -n "$APP" --query defaultHostName -o tsv)"
 echo "$URL"
 
-export API_USERNAME=...  API_PASSWORD=...
-AUTH="-u $API_USERNAME:$API_PASSWORD"
+export BASIC_AUTH_USER=...  BASIC_AUTH_PASSWORD=...
+AUTH="-u $BASIC_AUTH_USER:$BASIC_AUTH_PASSWORD"
 ```
 
 Cuidado con los dos pares de credenciales, que es la confusión más habitual de este servicio:
 
 | Par | Para qué |
 |-----|----------|
-| `API_USERNAME` / `API_PASSWORD` | Lo que **este** servicio exige a quien le llama. Es lo que usas en tus `curl` |
-| `USERS_SERVICE_USERNAME` / `USERS_SERVICE_PASSWORD` | Lo que **este** servicio presenta a `microservice-users`. Nunca lo usas tú directamente |
+| `BASIC_AUTH_USER` / `BASIC_AUTH_PASSWORD` | Lo que **este** servicio exige a quien le llama. Es lo que usas en tus `curl` |
+| `GATEWAY_BASIC_USER` / `GATEWAY_BASIC_PASSWORD` | Lo que **este** servicio presenta al gateway de Tyk, que es por donde llama a `microservice-users`. Nunca lo usas tú directamente |
 
 ### 3.2 Necesitas un usuario que exista
 
-Todos los endpoints de pedidos llaman antes a `GET {USERS_SERVICE_URL}/users/{userId}`. Si el
+Todos los endpoints de pedidos llaman antes a `GET {GATEWAY_BASE_URL}{GATEWAY_USERS_PATH}/users/{userId}`, es decir a través del gateway. Si el
 usuario no existe devuelven `404`, y si el servicio de usuarios no responde, `503`. Así que lo
 primero es crear un usuario en el otro servicio y quedarte con su id:
 
@@ -275,7 +278,7 @@ SELECT * FROM Span WHERE trace.id = '4bf92f3577b34da6a3ce929d0e0e4736'
 cp .env.example .env      # y rellena los CHANGE_ME
 set -a && . ./.env && set +a
 mvn spring-boot:run
-curl -u "$API_USERNAME:$API_PASSWORD" http://localhost:8080/status
+curl -u "$BASIC_AUTH_USER:$BASIC_AUTH_PASSWORD" http://localhost:8080/status
 ```
 
 En PowerShell:
@@ -299,7 +302,7 @@ az sql server firewall-rule create -g rg-ordersvc -s <servidor> \
   -n dev-laptop --start-ip-address "$MY_IP" --end-ip-address "$MY_IP"
 ```
 
-Y apunta `USERS_SERVICE_URL` al servicio de usuarios desplegado, o a uno local en otro puerto.
+Y apunta `GATEWAY_BASE_URL` al gateway desplegado, o a un Tyk local en `https://localhost:8443`.
 
 Para instrumentar también en local: `mvn package` (descarga el agente a
 `target/otel-javaagent.jar`) y descomenta `JAVA_TOOL_OPTIONS` en `.env`.
@@ -496,6 +499,37 @@ endpoint OTLP:
 Con `observability_enabled=false` en el despliegue, el agente sigue adjunto pero se
 autodesactiva (`OTEL_JAVAAGENT_ENABLED=false`) y los tres exporters pasan a `none`.
 
+### 4.7 Toda respuesta lleva `http.status_code`, incluidos los 401
+
+Esto era un bug y merece explicación, porque es la clase de error que se repite.
+
+`RequestLoggingFilter` estaba anotado con `@Order(1)`. La cadena de filtros de Spring Security se
+registra con orden **`-100`**, que es más prioritario. Consecuencia: Security se ejecutaba
+**antes**, respondía `401` y **nunca invocaba** el filtro de logging. Las peticiones rechazadas
+no dejaban ni línea de log ni atributo `http.status_code`, así que en New Relic un ataque de
+fuerza bruta contra la API era literalmente invisible.
+
+Ahora el filtro va con `@Order(Ordered.HIGHEST_PRECEDENCE)`, envolviendo toda la cadena. Con eso,
+**toda** respuesta queda registrada con su código, venga de un controlador, del
+`GlobalExceptionHandler` o de Security.
+
+```sql
+-- Antes esta consulta no devolvia ni un 401. Ahora si
+SELECT count(*) FROM Log
+WHERE service.name = 'microservice-orders' AND http.status_code IS NOT NULL
+SINCE 30 minutes ago FACET http.status_code
+
+-- Intentos de autenticacion fallidos, por IP de origen
+SELECT count(*) FROM Log
+WHERE service.name = 'microservice-orders' AND http.status_code = 401
+SINCE 1 hour ago FACET http.client_ip
+```
+
+El mismo fallo estaba en `microservice-users` y también está corregido allí. En este servicio
+importa además por otro motivo: el `503 Users Service Unavailable` sí se registraba, porque lo
+produce el `GlobalExceptionHandler` dentro de la cadena, pero los `401` de entrada no. Ahora la
+tabla de códigos está completa.
+
 ---
 
 ## 5. Telemetría de base de datos
@@ -573,7 +607,7 @@ datos reales enviados a la base de datos. Úsalo solo para depurar y quítalo de
 Devuélvelo a `INFO` en cuanto termines: sube bastante el volumen de logs y con la cuota diaria
 de 1 GB del workspace es fácil llegar al tope.
 
-> **Detalle que importa si tocas esto.** El nivel se declara en `application.yml` bajo
+> **Detalle que importa si tocas esto.** El nivel se declara en `application.yaml` bajo
 > `logging.level` como `org.hibernate.SQL: ${SQL_LOG_LEVEL:INFO}`, y **no** como un app setting
 > `LOGGING_LEVEL_ORG_HIBERNATE_SQL`. El relaxed binding de Spring Boot pasa a minúsculas los
 > nombres de las variables de entorno, y `org.hibernate.sql` es un logger distinto de
@@ -712,9 +746,271 @@ SQLSecurityAuditEvents
 ```
 
 No usa storage account ni ningún recurso extra: la plantilla lo declara con
-`isAzureMonitorTargetEnabled`, así que los registros salen por los Diagnostic Settings que ya
-existen. Lo que sí cuesta es la ingesta, y es verbosa: con la cuota diaria de 1 GB del
-workspace se llega al tope rápido. Enciéndela para la demo y apágala después.
+`isAzureMonitorTargetEnabled`. Lo que sí cuesta es la ingesta, y es verbosa: con la cuota diaria
+de 1 GB del workspace se llega al tope rápido. Enciéndela para la demo y apágala después.
+
+#### El destino de la auditoría: un solo Diagnostic Setting, y no puede faltar
+
+Aquí hay un detalle que cuesta un despliegue fallido si se toca mal, así que queda escrito.
+
+La política de auditoría con `isAzureMonitorTargetEnabled` **no lleva los registros a ningún
+sitio por sí sola**: los emite al canal de diagnóstico, y hace falta un Diagnostic Setting con la
+categoría `SQLSecurityAuditEvents` que los recoja. La documentación de Microsoft lo dice así:
+
+> *"When auditing is configured with Azure external monitors (for example, Event Hubs or Log
+> Analytics) as the target, an additional diagnostic settings resource named
+> `SQLSecurityAuditEvents_XXXX-XXXX-XXX` is created, which is critical for the proper functioning
+> of auditing."*
+>
+> *"If the diagnostic settings are deleted, either intentionally or unintentionally, the auditing
+> functionality will fail silently, and audit logs won't be sent to the target location."*
+
+Eso es lo que hacen el portal y los cmdlets de PowerShell: crean un setting **dedicado**. Desde
+Bicep **no hace falta crear uno aparte**, y de hecho **no se puede**: el `categoryGroup: 'allLogs'`
+de `diag-<bd>` ya incluye la categoría `SQLSecurityAuditEvents`, y Azure rechaza un segundo
+setting que apunte al mismo workspace para la misma categoría:
+
+```
+Conflict: Data sink '.../workspaces/log-usersvc' is already used in diagnostic setting
+'diag-sqldb-users' for category 'SQLSecurityAuditEvents'. Data sinks can't be reused in
+different settings on the same category for the same resource.
+```
+
+Ese error es, de paso, la prueba de que `allLogs` cubre la categoría de auditoría.
+
+**Consecuencia práctica, y es la que importa:** el Diagnostic Setting genérico es *también* el
+destino del rastro de auditoría. Si se apaga, la auditoría se queda muda sin dar ningún error. Por
+eso su condición en [`infra/modules/sql.bicep`](infra/modules/sql.bicep) es
+`if (enableLogAnalytics || enableSqlAudit)`: con la auditoría encendida el setting se crea
+**aunque** pongas `ENABLE_LOG_ANALYTICS=false`, precisamente para que seguir el consejo de apagar
+Log Analytics cuando el monitor nativo de New Relic ya reenvía los logos no rompa la auditoría en
+silencio.
+
+#### Si la auditoría está activa y no llega nada
+
+Recorre esto en orden, que es el diagnóstico real:
+
+```bash
+# 1. La politica de auditoria esta activa y apunta a Azure Monitor?
+az sql db audit-policy show -g rg-ordersvc -s <servidor> -n sqldb-orders   --query "{state:state, azureMonitor:isAzureMonitorTargetEnabled, grupos:auditActionsAndGroups}" -o json
+# state debe ser Enabled y azureMonitor true
+
+# 2. Existe el Diagnostic Setting que recoge la categoria?
+DB_ID=$(az sql db show -g rg-ordersvc -s <servidor> -n sqldb-orders --query id -o tsv)
+az monitor diagnostic-settings list --resource "$DB_ID"   --query "value[].{name:name, grupos:logs[?enabled].categoryGroup, categorias:logs[?enabled].category}" -o json
+
+# 3. Hay registros en la tabla?
+WS=$(az monitor log-analytics workspace show -g rg-ordersvc -n log-ordersvc --query customerId -o tsv)
+az monitor log-analytics query --workspace "$WS" --analytics-query "
+SQLSecurityAuditEvents | summarize count() by bin(TimeGenerated, 5m) | order by TimeGenerated desc"
+```
+
+Causas por orden de probabilidad si el paso 1 devuelve `Disabled`:
+
+| Causa | Comprobación |
+|-------|--------------|
+| Existe una **variable de repositorio** `ENABLE_SQL_AUDIT` con valor `false`, que gana al valor por defecto del workflow | `Settings > Secrets and variables > Actions > Variables` |
+| No se ha redesplegado desde que se activó | Revisar la fecha del último run de `deploy` |
+| El despliegue falló en el paso *Deploy infrastructure* y no llegó a aplicar la política | Log del workflow |
+
+Y si el paso 1 está bien pero el 3 sale vacío: recuerda que `BATCH_COMPLETED_GROUP` solo registra
+sentencias **ejecutadas**. Genera tráfico contra la API antes de mirar.
+
+> **Aviso operativo de la propia documentación:** si alguien borra el Diagnostic Setting, la
+> auditoría deja de emitir sin ningún error. Microsoft recomienda crear una alerta sobre el
+> borrado de diagnostic settings. En este PoC el redespliegue lo recrea, pero en un entorno real
+> esa alerta es lo que evita descubrirlo cuando alguien pide una auditoría.
+
+#### Y por qué pueden estar en Log Analytics pero no en New Relic
+
+Son **dos condiciones independientes** y hay que separarlas antes de tocar nada:
+
+| Condición | Qué la cumple | Cómo se comprueba |
+|-----------|---------------|-------------------|
+| **1. Que la auditoría genere registros** | La política de auditoría activa (`ENABLE_SQL_AUDIT`) | La tabla `SQLSecurityAuditEvents` del workspace tiene filas |
+| **2. Que Azure los reenvíe a New Relic** | El **servicio nativo** de New Relic, que crea un Diagnostic Setting hacia New Relic sobre la base de datos | `az monitor diagnostic-settings list` muestra una entrada apuntando a New Relic |
+
+Si la 1 se cumple y la 2 no, verás los logs en Log Analytics y **nunca** en New Relic, por muchas
+consultas que hagas. La base de datos no tiene agente: sus logs solo pueden llegar a New Relic por
+esa vía.
+
+**El caso que más despista:** la integración **por polling** (`newrelic-azure-integration`) trae
+**solo métricas, ningún log**. Con ella la entidad de la base de datos aparece en New Relic, con
+sus pestañas de métricas, y la de *Logs* dice para siempre *"We can't find any logs from this
+host"*. Es exactamente el síntoma de tener polling y no tener el servicio nativo.
+
+```bash
+# Existe el monitor nativo en la suscripcion? Si esto sale vacio,
+# NINGUN log de Azure Monitor llega a New Relic.
+az resource list --resource-type "NewRelic.Observability/monitors" -o table
+
+# Y sobre la base de datos, hay un setting que apunte a New Relic?
+DB_ID=$(az sql db show -g rg-ordersvc -s <servidor> -n sqldb-orders --query id -o tsv)
+az monitor diagnostic-settings list --resource "$DB_ID"   --query "value[].{name:name, workspace:workspaceId, newRelic:marketplacePartnerId}" -o json
+```
+
+Si el monitor no existe, el motivo casi seguro es que faltan los secrets `NR_ACCOUNT_ID`,
+`NR_ORGANIZATION_ID` y `NR_USER_EMAIL`: **el pipeline ya intenta crearlo en cada despliegue**, en
+el job `Ensure the New Relic native integration`. Ese job es `continue-on-error`, así que sale en
+rojo sin tumbar el despliegue de la aplicación. Mira su log: dirá exactamente qué secret falta.
+
+Una vez creado, recuerda que el Diagnostic Setting sobre un recurso puede tardar **hasta una
+hora** en aparecer.
+
+Mientras tanto, los logs sí están en Log Analytics y se consultan con la KQL de arriba.
+
+#### Azure dice "Sending" pero la pestaña *Logs* de la entidad está vacía
+
+Es el caso que más confunde, y **no es un fallo**. En el portal, sobre el recurso monitor >
+*Monitored Resources*, la columna *Logs to New Relic* en `Sending` significa que Azure está
+entregando. Si aun así la pestaña **Logs** de la entidad de la base de datos en New Relic dice
+*"We can't find any logs from this host"*, el motivo es dónde se busca:
+
+Esa pestaña correlaciona por **entidad de host**, y los logs que llegan de Azure Monitor no son
+logs de un host: son registros con atributos de Azure (`resourceId`, `category`, `operationName`).
+New Relic no los asocia a la entidad de infraestructura, así que la pestaña sale vacía **aunque
+los logs estén en la cuenta**.
+
+Búscalos por su atributo real, en **Query your data**:
+
+```sql
+-- Todo lo que llega de Azure Monitor, por recurso y categoria
+SELECT count(*) FROM Log
+WHERE resourceId IS NOT NULL SINCE 3 hours ago FACET resourceId, category
+
+-- Solo lo de SQL. El resourceId de Azure llega en MAYUSCULAS
+SELECT timestamp, category, operationName, resourceId FROM Log
+WHERE resourceId LIKE '%MICROSOFT.SQL%' SINCE 3 hours ago LIMIT 100
+```
+
+Si esas consultas devuelven filas, está todo funcionando y lo único que pasaba es que la pestaña
+de la entidad no es el sitio. Si devuelven cero **y** Azure dice `Sending`, entonces no se está
+generando ningún evento: repasa el bloque anterior, porque las categorías de Azure SQL son de
+eventos excepcionales y una consulta correcta no produce ninguna.
+
+Detalle que ayuda a interpretar la lista: junto a la base de datos aparece también **`master`**.
+Es normal y es buena señal: ahí es donde el motor escribe los eventos de conexión al servidor
+lógico.
+
+#### "Metrics not configured" es otra cosa, y probablemente un permiso
+
+En la misma pantalla, la columna *Metrics to New Relic* puede aparecer como **Metrics not
+configured** aunque las `tagRules` que despliega la plantilla pidan `sendMetrics: Enabled`.
+
+Las métricas y los logs no viajan igual. Los logs los entrega el resource provider por
+Diagnostic Settings. Las métricas las **lee** la identidad administrada del monitor, y para eso
+necesita el rol `Monitoring Reader` sobre la suscripción. Azure lo asigna por su cuenta, pero
+crear una asignación de rol requiere permisos de RBAC, y la identidad federada del pipeline tiene
+`Contributor`, que **no puede crear asignaciones de rol**.
+
+```bash
+# Que rol tiene la identidad del monitor
+MON_PRINCIPAL=$(az resource show -g rg-newrelic-shared -n newrelic-poc-observability   --resource-type "NewRelic.Observability/monitors" --query identity.principalId -o tsv)
+az role assignment list --assignee "$MON_PRINCIPAL" --all -o table
+
+# Y que dicen las tag rules realmente desplegadas
+az resource show -g rg-newrelic-shared --name "newrelic-poc-observability/default"   --resource-type "NewRelic.Observability/monitors/tagRules" --query properties -o json
+```
+
+Si la lista de roles sale vacía, asígnalo una vez a mano con una identidad que sí tenga permisos
+de RBAC:
+
+```bash
+SUB_ID=$(az account show --query id -o tsv)
+az role assignment create --assignee-object-id "$MON_PRINCIPAL"   --assignee-principal-type ServicePrincipal   --role "Monitoring Reader" --scope "/subscriptions/$SUB_ID"
+```
+
+No afecta a los logs, que es lo que estábamos persiguiendo: esos ya llegan sin este rol.
+
+#### Los logs siguen vacíos en New Relic: el orden correcto de comprobación
+
+"Sending" en el portal significa **el canal está sano**, no "hay datos". Separa las dos preguntas
+en este orden, porque cada una se responde en un sitio distinto:
+
+**1. ¿Se está generando algo?** Se responde en Log Analytics, no en New Relic.
+
+```bash
+WS=$(az monitor log-analytics workspace show -g rg-ordersvc -n log-ordersvc --query customerId -o tsv)
+
+# Auditoria
+az monitor log-analytics query --workspace "$WS" --analytics-query "
+SQLSecurityAuditEvents | summarize count() by bin(TimeGenerated, 10m) | order by TimeGenerated desc | take 20"
+
+# Resto de categorias de SQL
+az monitor log-analytics query --workspace "$WS" --analytics-query "
+AzureDiagnostics | where ResourceProvider == 'MICROSOFT.SQL'
+| summarize count() by Category | order by count_ desc"
+```
+
+Si esto sale **vacío**, New Relic no puede tener nada: no existe el dato. Lo primero a descartar
+es que la política de auditoría esté realmente aplicada, y para eso hace falta un despliegue
+**verde**: si el módulo `sql` falló en el último run, la política no se creó.
+
+```bash
+az sql db audit-policy show -g rg-ordersvc -s <servidor> -n sqldb-orders   --query "{state:state, azureMonitor:isAzureMonitorTargetEnabled}" -o json
+```
+
+**2. Si el paso 1 tiene filas y New Relic no**, entonces el problema es el destino o la consulta.
+No adivines el nombre de los atributos: pregúntaselo a New Relic.
+
+```sql
+-- Que atributos traen realmente los logs de esta cuenta
+SELECT keyset() FROM Log SINCE 1 day ago
+
+-- De donde viene cada log que llega
+SELECT count(*) FROM Log SINCE 1 day ago FACET service.name, collector.name, instrumentation.provider
+```
+
+Con eso ves si existe `resourceId` o si viene con otro nombre, y si hay algún log de origen Azure.
+
+**Y comprueba que es la misma cuenta.** Es la causa que más cuesta ver:
+
+| Camino | A qué cuenta de New Relic entrega |
+|--------|-----------------------------------|
+| Telemetría OTLP de la aplicación | La cuenta asociada a `NR_LICENSE_KEY` |
+| Logs de Azure Monitor | La cuenta cuyo id está en `NR_ACCOUNT_ID` |
+
+Si esos dos no son la misma cuenta, verás los logs de la aplicación donde estás mirando y los de
+la base de datos en otra, sin ningún error en ninguna parte. Compara el `NR_ACCOUNT_ID` del secret
+con el id de cuenta que aparece en la esquina de la interfaz donde estás consultando.
+
+#### Tabla dedicada o AzureDiagnostics: por qué una consulta correcta sale vacía
+
+Síntoma real que costó encontrar: la auditoría genera miles de registros y la tabla
+`SQLSecurityAuditEvents` está vacía.
+
+```
+AzureDiagnostics | where ResourceProvider == 'MICROSOFT.SQL'
+| summarize count() by Category
+-->  SQLSecurityAuditEvents  3676
+     DatabaseWaitStatistics   261
+     ...
+
+SQLSecurityAuditEvents | summarize count() by bin(TimeGenerated, 10m)
+-->  []
+```
+
+No es una contradicción: son dos **modos de recolección** del Diagnostic Setting.
+
+| Modo | Dónde acaba el dato | Columnas |
+|------|---------------------|----------|
+| `AzureDiagnostics` (**por defecto**) | Todo en la tabla genérica `AzureDiagnostics`, con `Category` como discriminador | Dinámicas y con sufijo de tipo: `statement_s`, `client_ip_s`, `duration_milliseconds_d` |
+| `Dedicated` | Una tabla por categoría: `SQLSecurityAuditEvents`, `AppServiceHTTPLogs`, `ContainerRegistryLoginEvents`... | Con su nombre real: `Statement`, `ClientIp`, `DurationMs` |
+
+Los Diagnostic Settings de este PoC declaran ahora **`logAnalyticsDestinationType: 'Dedicated'`**,
+que es lo que hace válidas las consultas de este README. Sin esa línea, la categoría aparece en
+`AzureDiagnostics` y la tabla dedicada existe pero vacía.
+
+**Al cambiarlo, el dato anterior no se mueve.** Lo ya ingestado se queda en `AzureDiagnostics` y
+solo lo nuevo va a la tabla dedicada, así que justo después de redesplegar conviene consultar las
+dos. Equivalencia para el dato antiguo:
+
+```kusto
+AzureDiagnostics
+| where ResourceProvider == 'MICROSOFT.SQL' and Category == 'SQLSecurityAuditEvents'
+| project TimeGenerated, statement_s, server_principal_name_s, client_ip_s, duration_milliseconds_d
+| order by TimeGenerated desc | take 50
+```
 
 #### Auditoría o logs de la aplicación: cuál usar
 
@@ -795,8 +1091,9 @@ Recorre esta lista en orden; está ordenada por probabilidad.
 | Llegan trazas pero **no logs** | El agente no está adjunto o Logback no está instrumentado | `az webapp log tail` y buscar los errores del agente al arrancar |
 | Llegan logs pero **no sentencias SQL** | `SQL_LOG_LEVEL` sigue en `INFO`, que es el valor por defecto | Ponerla en `DEBUG` y redesplegar. Ver [5.2](#52-logs-de-sql-hay-que-activarlos) |
 | No hay **logs de BD en Log Analytics** | Las consultas correctas no generan logs de plataforma; solo lo hacen los errores, timeouts, bloqueos y el Query Store cada 60 min | Mirar `AzureMetrics` en vez de `AzureDiagnostics`. Ver [5.3](#53-logs-de-plataforma-del-servicio-sql) |
-| La entidad de la BD en New Relic dice **"0 logs found"** | Lo mismo: sin errores no hay logs que reenviar. La auditoría, que sí registra cada sentencia, está apagada por defecto | `ENABLE_SQL_AUDIT=true` y redesplegar. Ver [5.4](#54-auditoría-el-log-por-sentencia-del-propio-motor) |
-| Todos los pedidos dan **`503`** | `microservice-users` no responde, o `USERS_SERVICE_URL` apunta mal | `curl $URL/status` y mirar el check `external_api_users` |
+| La entidad de la BD en New Relic dice **"0 logs found"** | Sin errores no hay logs de plataforma que reenviar, y la auditoría está apagada por defecto | `ENABLE_SQL_AUDIT=true` y redesplegar. Ver [5.4](#54-auditoría-el-log-por-sentencia-del-propio-motor) |
+| **`ENABLE_SQL_AUDIT=true` y aun así no llega nada** | Lo más probable: existe una variable de repositorio `ENABLE_SQL_AUDIT=false` que gana al valor por defecto del workflow, o no se ha redesplegado. Si `audit-policy show` dice `Disabled`, la política no se aplicó | Seguir el diagnóstico de [5.4](#si-la-auditoría-está-activa-y-no-llega-nada) paso a paso |
+| Todos los pedidos dan **`503`** | El gateway no responde, `GATEWAY_BASE_URL` está vacía o apunta mal, o el gateway no puede alcanzar users | `curl $URL/status` y mirar el check `external_api_users` |
 | Todos los pedidos dan **`404`** | El `userId` no existe en `microservice-users` | Crear el usuario allí primero. Ver [3.2](#32-necesitas-un-usuario-que-exista) |
 | Los datos llegan **con retraso** | Normal: 1-2 min para trazas y logs, hasta 30 s de intervalo de exportación para métricas | Esperar y refrescar |
 | Un cambio de variable **no se refleja** | La aplicación no ha releído los settings | El pipeline reinicia la app y verifica los settings; revisar el paso *Verify the effective application settings* |
@@ -860,22 +1157,23 @@ Todo lo de esta sección se hace **una sola vez**. Después, cada despliegue es 
 | `AZURE_SUBSCRIPTION_ID` | Id de la suscripción | `az account show --query id -o tsv` |
 | `SQL_ADMIN_USER` | Login del administrador de SQL. **No puede ser** `admin`, `administrator`, `sa`, `root`, `dbmanager` ni `loginmanager` | por ejemplo `sqladminpoc` |
 | `SQL_ADMIN_PASSWORD` | Contraseña del administrador. Mínimo 8 caracteres con 3 de: mayúscula, minúscula, dígito, símbolo | `openssl rand -base64 24` |
-| `API_USERNAME` | Usuario Basic Auth que acepta **esta** API | debe coincidir con `UPSTREAM_ORDERS_BASIC_USER` en el repo del gateway |
-| `API_PASSWORD` | Contraseña Basic Auth de esta API | `openssl rand -hex 24` |
-| `USERS_SERVICE_USERNAME` | Usuario Basic Auth que **esta** API presenta a `microservice-users` | es el `BASIC_AUTH_USER` del repositorio de users |
-| `USERS_SERVICE_PASSWORD` | Contraseña presentada a `microservice-users` | es el `BASIC_AUTH_PASSWORD` del repositorio de users |
+| `BASIC_AUTH_USER` | Usuario Basic Auth que acepta **esta** API | debe coincidir con `UPSTREAM_ORDERS_BASIC_USER` en el repo del gateway |
+| `BASIC_AUTH_PASSWORD` | Contraseña Basic Auth de esta API | `openssl rand -hex 24` |
+| `GATEWAY_BASIC_USER` | Usuario de consumidor que **esta** API presenta al gateway | es el `USERNAME_API_USERS` del repositorio del gateway |
+| `GATEWAY_BASIC_PASSWORD` | Contraseña de consumidor presentada al gateway | es el `PASSWORD_API_USERS` del repositorio del gateway |
 | `NR_LICENSE_KEY` | License key de **ingesta** de New Relic (no una User API key) | New Relic > Administration > API keys > tipo `INGEST - LICENSE` |
 | `GH_ADMIN_TOKEN` | PAT con escritura sobre *Environments* y *Secrets*. **Solo** lo usa el workflow `newrelic-azure-integration`; `deploy` no lo necesita | GitHub > Settings > Developer settings > Personal access tokens |
 | `NR_ACCOUNT_ID` / `NR_ORGANIZATION_ID` / `NR_USER_EMAIL` | Identificadores de la cuenta de New Relic. **Solo** los usa el workflow `newrelic-native-integration`, y solo si lo lanzas desde este repositorio en lugar del de users | one.newrelic.com > Administration |
 
 No confundas los dos pares de credenciales: `API_*` es lo que este servicio **exige** a quien
-le llama; `USERS_SERVICE_*` es lo que este servicio **presenta** al servicio de usuarios.
+le llama; `GATEWAY_*` es lo que este servicio **presenta** al gateway de Tyk.
 
 ### 9.2 Variables de GitHub
 
 | Variable | Descripción | Por defecto |
 |----------|-------------|-------------|
-| `USERS_SERVICE_URL` | **Obligatoria.** URL base de `microservice-users`, sin barra final. Ej.: `https://app-usersvc-xxxx.azurewebsites.net` | ninguno, el workflow falla |
+| `GATEWAY_BASE_URL` | **Override manual** de la url del gateway, sin barra final. Si se deja vacía, el pipeline la descubre por etiqueta, que es lo recomendado | vacía, se descubre |
+| `GATEWAY_USERS_PATH` | Listen path con el que el gateway publica la API de usuarios | `/api-users/v1` |
 | `AZURE_LOCATION` | Región de Azure | `westeurope` |
 | `AZURE_RESOURCE_GROUP` | Resource group del PoC | `rg-ordersvc` |
 | `POC_NAME_PREFIX` | Prefijo de nombres, 3-12 caracteres | `ordersvc` |
@@ -895,11 +1193,10 @@ le llama; `USERS_SERVICE_*` es lo que este servicio **presenta** al servicio de 
 | `ENABLE_LOG_ANALYTICS` | Enviar los Diagnostic Settings a Log Analytics. Ponlo a `false` cuando el servicio nativo de New Relic ya reenvíe los logs, para no ingerir el mismo dato dos veces | `true` |
 | `ENABLE_SQL_AUDIT` | Activa Azure SQL Auditing, el único log por sentencia que emite el motor. Verboso: enciéndelo solo mientras lo necesites | `false` |
 | `ENABLE_ACTIVITY_LOG_EXPORT` | Exportar el Activity Log de la suscripción | `false` |
-| `ENABLE_SCHEDULED_CLEANUP` | Activa la limpieza horaria programada | desactivada |
-| `POC_MAX_AGE_HOURS` | Edad máxima antes del borrado programado | `2` |
 | `NR_REGION` | Región de la cuenta de New Relic, `eu` o `us`. Solo la usa `newrelic-native-integration` | `eu` |
+| `NR_MONITOR_LOCATION` | Región del recurso monitor de New Relic. **No es la del PoC**: el tipo `NewRelic.Observability/monitors` no existe en todas las regiones. El workflow consulta al proveedor y la corrige sola si el valor no es válido | `eastus` |
 
-El workflow valida `USERS_SERVICE_URL` antes de compilar: exige que exista y que no termine en
+El workflow comprueba `GATEWAY_BASE_URL` antes de compilar: si está vacía anuncia que la descubrirá tras el login de Azure; si tiene valor, exige que no termine en
 `/` (una barra final produciría URLs con doble barra al concatenar `/users/{id}`).
 
 > **`NR_OTLP_ENDPOINT` debe corresponder a la región de tu cuenta de New Relic.** Una license
@@ -1002,7 +1299,7 @@ done
 | `Contributor` en la suscripción | Azure | Crear RG, recursos y la regla de firewall temporal |
 | Registrar `Web`, `Sql`, `OperationalInsights`, `Insights` | Azure | Los recursos se pueden crear |
 | Crear los secrets | GitHub | El pipeline tiene las credenciales |
-| Crear la variable `USERS_SERVICE_URL` | GitHub | El servicio sabe contra quién validar |
+| Crear la variable `GATEWAY_BASE_URL` | GitHub | El servicio sabe por dónde llamar a users |
 
 ---
 
@@ -1010,15 +1307,55 @@ done
 
 ### 10.1 Orden correcto
 
-1. Desplegar `poc-microservice-users` y anotar su URL.
-2. Crear aquí la variable `USERS_SERVICE_URL` con esa URL.
-3. Crear `USERS_SERVICE_USERNAME` y `USERS_SERVICE_PASSWORD` con las credenciales que acepta
-   ese servicio (`BASIC_AUTH_USER` / `BASIC_AUTH_PASSWORD` en su repositorio).
-4. Lanzar este workflow.
+Este servicio llama a `microservice-users` **a través del gateway de Tyk**, y eso crea una
+dependencia circular en el arranque del PoC:
 
-Si se despliega orders sin users, la aplicación arranca y `/actuator/health` responde `UP` (su
-health check no incluye el servicio externo), pero cualquier llamada a un pedido devuelve
-`503 Users Service Unavailable`. El pipeline lo detecta y lo avisa sin fallar el despliegue.
+```
+orders  necesita la URL del gateway   (para llamar a users)
+gateway necesita la URL de orders     (para enrutar hacia el)
+```
+
+No se puede satisfacer en un solo paso, así que **orders se despliega dos veces**:
+
+| Paso | Qué | Estado esperado |
+|------|-----|-----------------|
+| 1 | Desplegar `poc-microservice-users` | Funcionando |
+| 2 | Desplegar **orders**. El gateway todavía no existe | Arranca. `/actuator/health` responde `UP`, pero **todo pedido devuelve `503`**. El pipeline lo avisa con un warning, no falla |
+| 3 | Desplegar `poc-tyk-api-gateway`, con las URL de users y de orders | El gateway ya puede enrutar a los dos |
+| 4 | **Relanzar el deploy de orders** | Descubre el gateway solo y los pedidos empiezan a funcionar |
+
+**La url del gateway no se pega a mano.** El paso `Resolve the gateway url` del pipeline la
+resuelve preguntando a Azure por el Container App etiquetado `project=poc-tyk-api-gateway`:
+
+```bash
+az containerapp list   --query "[?tags.project=='poc-tyk-api-gateway'].properties.configuration.ingress.fqdn | [0]" -o tsv
+```
+
+Y esto **no es solo comodidad**. El FQDN de Container Apps incluye un dominio generado por el
+entorno, y el entorno se recrea con cada `destroy` del PoC. Una url pegada a mano en una variable
+de repositorio **se queda obsoleta en cada ciclo de destrucción**, y el síntoma es que todos los
+pedidos empiezan a dar `503` sin que nadie haya cambiado nada. Descubriéndola en cada despliegue
+el problema desaparece.
+
+La variable de repositorio `GATEWAY_BASE_URL` sigue existiendo como **override manual**: si tiene
+valor, gana y no se descubre nada. Útil para apuntar a un gateway concreto en pruebas.
+
+Lo que el paso 4 sigue necesitando es **relanzar el workflow**: el descubrimiento ocurre durante
+el despliegue de orders, así que hasta que no se ejecute de nuevo, el App Service conserva el
+valor vacío de la vez anterior.
+
+Las credenciales de esta ruta son las de **consumidor del gateway**, no el Basic Auth de
+`microservice-users`: Tyk sustituye la cabecera `Authorization` por la del upstream antes de
+reenviar, así que orders nunca conoce la credencial del microservicio.
+
+| Aquí | Es | Sale de |
+|------|----|---------|
+| `GATEWAY_BASE_URL` | Base del gateway, sin barra final | FQDN del Container App del gateway |
+| `GATEWAY_USERS_PATH` | Listen path de la API de usuarios | `/api-users/v1`, el `listen_path` de la definición de API en Tyk |
+| `GATEWAY_BASIC_USER` / `GATEWAY_BASIC_PASSWORD` | Credenciales de consumidor | `USERNAME_API_USERS` / `PASSWORD_API_USERS` del repositorio del gateway |
+
+Beneficio de pasar por el gateway, más allá de que sea la arquitectura correcta: la traza pasa a
+tener **tres saltos**, `orders → tyk-gateway → users`, y se ve el coste de cada uno por separado.
 
 ### 10.2 Desde GitHub Actions
 
@@ -1027,13 +1364,12 @@ health check no incluye el servicio externo), pero cualquier llamada a un pedido
 
 | Input | Descripción | Por defecto |
 |-------|-------------|-------------|
-| `auto_destroy_minutes` | Minutos hasta borrar el resource group. `0` lo desactiva | `60` |
 | `observability_enabled` | Adjuntar el agente OTel y exportar a New Relic | `true` |
 | `apply_schema` | Aplicar `database.sql` a la base de datos | `true` |
 
 Secuencia del pipeline:
 
-1. Comprueba y enmascara los secretos funcionales; valida `USERS_SERVICE_URL`.
+1. Comprueba y enmascara los secretos funcionales; comprueba `GATEWAY_BASE_URL` (avisa si está vacía, no falla).
 2. Compila con Maven, que además descarga el agente OTel a `target/otel-javaagent.jar`.
 3. Empaqueta `app.jar` + `otel-javaagent.jar` en `app.zip`. El jar se renombra a `app.jar`,
    que es el nombre que arranca la imagen Java SE de App Service.
@@ -1053,7 +1389,6 @@ Secuencia del pipeline:
      Eso ejecuta un `SELECT 1` real contra Azure SQL.
    - `/users/<uuid>/orders` con credenciales debe devolver `404` (usuario desconocido, es
      decir, el servicio de usuarios contestó). Un `503` se reporta como aviso sin fallar.
-9. Job `auto-destroy`: espera el TTL y borra el resource group.
 
 Cambiar una variable o un secreto en GitHub y relanzar `deploy` **basta** para que el App
 Service lo recoja: los app settings se aplican como recurso hijo
@@ -1065,9 +1400,10 @@ Service lo recoja: los app settings se aplican como recurso hijo
 az login
 export AZURE_LOCATION=westeurope AZURE_RESOURCE_GROUP=rg-ordersvc POC_NAME_PREFIX=ordersvc
 export SQL_ADMIN_USER=... SQL_ADMIN_PASSWORD=...
-export API_USERNAME=... API_PASSWORD=...
-export USERS_SERVICE_URL=https://app-usersvc-xxxx.azurewebsites.net
-export USERS_SERVICE_USERNAME=... USERS_SERVICE_PASSWORD=...
+export BASIC_AUTH_USER=... BASIC_AUTH_PASSWORD=...
+export GATEWAY_BASE_URL=https://ca-tykpoc-gw.xxxx.westeurope.azurecontainerapps.io
+export GATEWAY_USERS_PATH=/api-users/v1
+export GATEWAY_BASIC_USER=... GATEWAY_BASIC_PASSWORD=...
 export NR_LICENSE_KEY=...
 
 # El fichero .bicepparam declara su plantilla con "using": no se pasa --template-file
@@ -1114,7 +1450,23 @@ A partir de ahí, Azure pone y quita por sí mismo los Diagnostic Settings hacia
 cada recurso nuevo que encaje en las reglas. No hace falta Event Hub, ni Storage Account, ni
 Function App, ni app de Entra ID: **0 EUR de recursos de reenvío**.
 
-> **Se ejecuta una sola vez por suscripción, no una por repositorio.** Este workflow y sus tres
+> **Ya no hay que lanzarlo a mano.** El job `newrelic-monitor` de `deploy.yml` lo invoca como
+> workflow reutilizable en **cada despliegue**, porque dejarlo como un paso manual significaba que
+> si nadie lo ejecutaba los logs de base de datos no llegaban nunca a New Relic, y sin ningún
+> error visible.
+>
+> **Y si el monitor ya existe, no lo toca.** Reaplicar el recurso **no es idempotente**: un PUT
+> sobre un monitor ya vinculado falla con `ResourceCreationValidateFailed: An internal server
+> error occurred`, porque el payload de vinculación de la cuenta no se puede reenviar. El workflow
+> comprueba antes y, si está, se limita a informar. Para cambiar las tag rules hay que lanzarlo a
+> mano con `force_redeploy=true`, sabiendo que puede fallar por el mismo motivo; si falla, la vía
+> es editar las reglas en el portal o borrar y recrear el monitor.
+>
+> Si faltan los secrets de New Relic el workflow **avisa y no hace nada** en lugar de fallar, así
+> que no tumba el despliegue de la aplicación. Sigue existiendo el `workflow_dispatch` para
+> lanzarlo suelto.
+>
+> **Se aplica una sola vez por suscripción, no una por repositorio.** Este workflow y sus tres
 > ficheros Bicep son **idénticos** en `poc-microservice-users` y aquí, y los dos apuntan al
 > mismo resource group y al mismo nombre de monitor, así que da igual desde cuál lo lances: el
 > segundo lanzamiento simplemente reaplica el mismo recurso. El monitor cubre **toda la
@@ -1135,6 +1487,19 @@ Secrets que necesita:
 | `NR_LICENSE_KEY` | El mismo ingest key que ya usa la aplicación |
 
 Y la variable `NR_REGION` (`eu` o `us`), que debe coincidir con la región de la cuenta.
+
+El recurso monitor **no vive en la misma región que el PoC**, y no es un descuido: el tipo
+`NewRelic.Observability/monitors` solo está disponible en algunas regiones, y desplegarlo en
+`westeurope` falla con `LocationNotAvailableForResourceType`. No afecta a la cobertura, porque las
+tag rules aplican a **toda la suscripción** independientemente de donde viva el monitor.
+
+El workflow lo resuelve solo: pregunta al proveedor qué regiones ofrece y, si la configurada no
+está en la lista, usa la primera válida y lo deja avisado en el resumen. Para consultarlo a mano:
+
+```bash
+az provider show --namespace NewRelic.Observability   --query "resourceTypes[?resourceType=='monitors'].locations" -o json
+```
+
 
 Después de que exista el monitor:
 
@@ -1229,9 +1594,10 @@ Ver [`.env.example`](.env.example) para el fichero completo. Resumen de lo funci
 | `SQL_SERVER_PORT` | Puerto de SQL, `1433` | app setting |
 | `SQL_DATABASE` | Nombre de la base de datos | variable `SQL_DATABASE_NAME` |
 | `SQL_USERNAME` / `SQL_PASSWORD` | Credenciales de SQL | secrets `SQL_ADMIN_USER` / `SQL_ADMIN_PASSWORD` |
-| `API_USERNAME` / `API_PASSWORD` | Credenciales que exige esta API | secrets homónimos |
-| `USERS_SERVICE_URL` | URL base de `microservice-users` | variable homónima |
-| `USERS_SERVICE_USERNAME` / `USERS_SERVICE_PASSWORD` | Credenciales presentadas a `microservice-users` | secrets homónimos |
+| `BASIC_AUTH_USER` / `BASIC_AUTH_PASSWORD` | Credenciales que exige esta API | secrets homónimos |
+| `GATEWAY_BASE_URL` | URL base del gateway de Tyk, por donde se llama a users | variable homónima |
+| `GATEWAY_USERS_PATH` | Listen path de la API de usuarios en el gateway | variable homónima |
+| `GATEWAY_BASIC_USER` / `GATEWAY_BASIC_PASSWORD` | Credenciales de consumidor del gateway | secrets homónimos |
 | `OTEL_*` | Configuración del agente | ver sección 4.6 |
 
 ---
@@ -1261,17 +1627,16 @@ Service Plan si expones el id del plan existente como parámetro en uno de los d
 
 ## 14. Limpieza de recursos
 
-- **Manual**: Actions > `destroy` > `Run workflow`, escribiendo `DESTROY`.
-- **`auto-destroy`** de `deploy.yml`: espera `auto_destroy_minutes` (60 por defecto). Solo en
-  ejecuciones manuales; cancelar la ejecución cancela la limpieza.
-- **Programada**: cada hora, si `ENABLE_SCHEDULED_CLEANUP=true`, borra los resource groups con
-  `project=poc-microservice-orders` cuyo tag `createdAt` supere `POC_MAX_AGE_HOURS`.
+> **No hay borrado automático.** Se eliminaron el workflow `destroy` y el job `auto-destroy`
+> del pipeline porque fallaban. **La limpieza es manual**, así que el PoC sigue facturando hasta
+> que lo borres tú.
 
 ```bash
 az group delete --name rg-ordersvc --yes
 ```
 
-> **Advertencia de coste.** Sin destruir, el plan B1 y la base de datos facturan de forma
+> **Advertencia de coste, y ahora importa más.** Al no haber ninguna red de seguridad
+> automática, sin destruir el plan B1 y la base de datos facturan de forma
 > continua aunque no haya tráfico: del orden de **17 EUR al mes**. Borrar el resource group
 > elimina la base de datos, **sus backups y todos los pedidos almacenados**.
 
@@ -1315,7 +1680,8 @@ Son aceptables en un PoC y no lo serían en producción:
 4. **`/status` llama a `httpbin.org`** en cada invocación: una dependencia de terceros no
    controlada dentro de un endpoint de estado. Conviene quitarlo antes de cualquier uso serio.
 5. **La cadena de credenciales está duplicada**: `API_*` aquí debe coincidir con
-   `UPSTREAM_ORDERS_BASIC_*` en el gateway, y `USERS_SERVICE_*` con `BASIC_AUTH_*` del servicio
+   `UPSTREAM_ORDERS_BASIC_*` en el gateway, y `GATEWAY_BASIC_*` con `USERNAME_API_USERS` /
+   `PASSWORD_API_USERS` del
    de usuarios. Cualquier rotación hay que hacerla en los dos repositorios a la vez.
 
 ### Rotación de secretos
@@ -1323,8 +1689,8 @@ Son aceptables en un PoC y no lo serían en producción:
 | Secreto | Cómo rotarlo |
 |---------|--------------|
 | `SQL_ADMIN_PASSWORD` | `az sql server update -g rg-ordersvc -n <server> --admin-password <nueva>`, actualizar el secret y relanzar `deploy` |
-| `API_USERNAME` / `API_PASSWORD` | Actualizar el secret, relanzar `deploy` y actualizar `UPSTREAM_ORDERS_BASIC_*` en el repositorio del gateway |
-| `USERS_SERVICE_*` | Rotar primero en `microservice-users`, después aquí, y relanzar ambos despliegues |
+| `BASIC_AUTH_USER` / `BASIC_AUTH_PASSWORD` | Actualizar el secret, relanzar `deploy` y actualizar `UPSTREAM_ORDERS_BASIC_*` en el repositorio del gateway |
+| `GATEWAY_BASIC_*` | Rotar primero la key de consumidor en el repositorio del gateway, después aquí, y relanzar ambos despliegues |
 | `NR_LICENSE_KEY` | Crear una key nueva en New Relic, actualizar el secret, relanzar y borrar la antigua |
 | Credencial federada OIDC | `az ad app federated-credential delete` y volver a crearla |
 

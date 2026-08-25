@@ -11,6 +11,10 @@ using './newrelic.bicep'
 param location = readEnvironmentVariable('AZURE_LOCATION', 'westeurope')
 param resourceGroupName = readEnvironmentVariable('NR_RESOURCE_GROUP', 'rg-newrelic-shared')
 param monitorName = readEnvironmentVariable('NR_MONITOR_NAME', 'newrelic-poc-observability')
+// El tipo NewRelic.Observability/monitors no esta disponible en todas las
+// regiones. Si el despliegue falla con LocationNotAvailableForResourceType,
+// consulta las regiones validas y pon una en NR_MONITOR_LOCATION.
+param monitorLocation = readEnvironmentVariable('NR_MONITOR_LOCATION', 'eastus')
 param owner = readEnvironmentVariable('POC_OWNER', 'unknown')
 
 param newRelicAccountId = readEnvironmentVariable('NR_ACCOUNT_ID', '')

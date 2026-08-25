@@ -10,11 +10,17 @@
 # Run it ONCE per subscription and per New Relic organization. Two monitor
 # resources linked to the same organization forward the same logs twice.
 #
-# This file is identical in every microservice repository of the PoC, and all of
-# them target the same shared resource group and monitor name, so it does not
-# matter which one you launch it from: the second run just reapplies the same
-# resource. Do not change the name per repository, or you get one monitor per
-# repository and duplicated ingest.
+# This file is identical in every repository of the PoC and all of them target
+# the same shared resource group and monitor name, so it does not matter which
+# one you launch it from. Do not change the name per repository, or you get one
+# monitor per repository and duplicated ingest.
+#
+# IMPORTANT: reapplying an existing monitor is NOT idempotent. A PUT over a
+# monitor that is already linked fails with "ResourceCreationValidateFailed: An
+# internal server error occurred", because the account linking payload cannot be
+# replayed. So this workflow checks first and, if the monitor exists, leaves it
+# alone. Use force_redeploy=true only to change the tag rules, knowing it may
+# fail.
 #
 # It links the existing New Relic account (accountCreationSource = NEWRELIC),
 # so billing stays with New Relic and no Marketplace SaaS resource is created.
@@ -48,6 +54,50 @@ on:
         description: 'Resource group that holds the monitor. Must outlive the PoC'
         required: false
         default: 'rg-newrelic-shared'
+      force_redeploy:
+        description: 'Reapply the monitor even if it already exists. Necesario para cambiar las tag rules, pero puede fallar: el payload de vinculacion de la cuenta no siempre se puede reenviar'
+        required: false
+        default: 'false'
+
+  # Reusable, so deploy.yml can guarantee the monitor exists on every run
+  # instead of depending on somebody having launched this workflow by hand once.
+  # Cuando ya existe, el workflow no lo toca: solo lo crea si falta.
+  workflow_call:
+    inputs:
+      send_metrics:
+        type: string
+        required: false
+        default: 'true'
+      send_resource_logs:
+        type: string
+        required: false
+        default: 'true'
+      send_activity_logs:
+        type: string
+        required: false
+        default: 'true'
+      monitor_name:
+        type: string
+        required: false
+        default: 'newrelic-poc-observability'
+      resource_group:
+        type: string
+        required: false
+        default: 'rg-newrelic-shared'
+      # Cuando lo llama deploy.yml se pasa 'true': si faltan los secrets de New
+      # Relic el workflow no falla, solo avisa y no hace nada. Asi el despliegue
+      # de la aplicacion no se rompe por una integracion que es opcional.
+      # No se puede usar continue-on-error en el job que llama: GitHub no lo
+      # admite en jobs que invocan un workflow reutilizable.
+      skip_if_unconfigured:
+        type: string
+        required: false
+        default: 'false'
+      # Desde deploy.yml se deja en false: si el monitor ya existe no se toca.
+      force_redeploy:
+        type: string
+        required: false
+        default: 'false'
 
 permissions:
   id-token: write
@@ -61,6 +111,10 @@ env:
   AZURE_LOCATION: ${{ vars.AZURE_LOCATION || 'westeurope' }}
   POC_OWNER: ${{ vars.POC_OWNER || 'unknown' }}
   NR_REGION: ${{ vars.NR_REGION || 'eu' }}
+  # Region del recurso monitor, distinta de la del PoC: el tipo
+  # NewRelic.Observability/monitors no existe en todas las regiones. No afecta
+  # a la cobertura, que es de toda la suscripcion por tag rules.
+  NR_MONITOR_LOCATION: ${{ vars.NR_MONITOR_LOCATION || 'eastus' }}
   NR_RESOURCE_GROUP: ${{ inputs.resource_group }}
   NR_MONITOR_NAME: ${{ inputs.monitor_name }}
   NR_SEND_METRICS: ${{ inputs.send_metrics }}
@@ -78,25 +132,43 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Check the required secrets
+        id: check
         env:
           NR_ACCOUNT_ID: ${{ secrets.NR_ACCOUNT_ID }}
           NR_ORGANIZATION_ID: ${{ secrets.NR_ORGANIZATION_ID }}
           NR_LICENSE_KEY: ${{ secrets.NR_LICENSE_KEY }}
           NR_USER_EMAIL: ${{ secrets.NR_USER_EMAIL }}
+          SKIP_IF_UNCONFIGURED: ${{ inputs.skip_if_unconfigured }}
         run: |
+          missing=""
           for name in NR_ACCOUNT_ID NR_ORGANIZATION_ID NR_LICENSE_KEY NR_USER_EMAIL; do
             value="${!name}"
             if [ -z "$value" ]; then
-              echo "ERROR: required secret $name is not configured." >&2
-              echo "NR_ACCOUNT_ID and NR_ORGANIZATION_ID are in one.newrelic.com," >&2
-              echo "under Administration. NR_USER_EMAIL is the account owner email." >&2
-              exit 1
+              missing="${missing} ${name}"
+            else
+              echo "::add-mask::$value"
             fi
-            echo "::add-mask::$value"
           done
+
+          if [ -n "$missing" ]; then
+            # Ejecutado desde deploy.yml: avisa y no hace nada, en lugar de
+            # tumbar el run entero por una integracion opcional.
+            if [ "${SKIP_IF_UNCONFIGURED:-false}" = "true" ]; then
+              echo "ready=false" >> "$GITHUB_OUTPUT"
+              echo "::warning title=New Relic native integration skipped::Missing secrets:${missing}. Azure Monitor logs (SQL Database platform logs and auditing) will NOT reach New Relic until they are configured."
+              exit 0
+            fi
+            echo "ERROR: required secrets are not configured:${missing}" >&2
+            echo "NR_ACCOUNT_ID and NR_ORGANIZATION_ID are in one.newrelic.com," >&2
+            echo "under Administration. NR_USER_EMAIL is the account owner email." >&2
+            exit 1
+          fi
+
+          echo "ready=true" >> "$GITHUB_OUTPUT"
           echo "All required secrets are present."
 
       - name: Azure login with OIDC
+        if: steps.check.outputs.ready == 'true'
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -104,9 +176,11 @@ jobs:
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Install Bicep CLI
+        if: steps.check.outputs.ready == 'true'
         run: az bicep install
 
       - name: Register the NewRelic.Observability provider
+        if: steps.check.outputs.ready == 'true'
         run: |
           set -euo pipefail
           state=$(az provider show --namespace NewRelic.Observability --query registrationState -o tsv 2>/dev/null || echo "NotRegistered")
@@ -117,19 +191,53 @@ jobs:
           az provider show --namespace NewRelic.Observability \
             --query "{namespace:namespace,state:registrationState}" -o table
 
-      # A second monitor linked to the same organization would duplicate every
-      # log record. This workflow is identical in every microservice repository
-      # and always targets the same shared resource group and monitor name, so
-      # running it again from any of them is idempotent: it redeploys the same
-      # resource. What is NOT safe is deploying under a different name while one
-      # already exists, because that does create a second monitor. That case is
-      # rejected here instead of being discovered on the New Relic invoice.
+      # NewRelic.Observability/monitors no existe en todas las regiones, y la
+      # lista depende de la suscripcion. En lugar de fijar una y que el
+      # despliegue falle con LocationNotAvailableForResourceType, se pregunta al
+      # propio proveedor y se elige una valida.
+      - name: Resolve a valid region for the monitor resource
+        if: steps.check.outputs.ready == 'true'
+        run: |
+          set -euo pipefail
+          raw=$(az provider show --namespace NewRelic.Observability \
+            --query "resourceTypes[?resourceType=='monitors'].locations | [0]" -o json)
+          echo "Regions offered by the provider: ${raw}"
+
+          # El proveedor devuelve nombres para mostrar ("East US") y ARM espera
+          # el nombre corto ("eastus").
+          available=$(echo "$raw" | jq -r '.[]? | ascii_downcase | gsub(" "; "")')
+
+          if [ -z "$available" ]; then
+            echo "::warning::The provider reported no regions for the monitor resource. Keeping ${NR_MONITOR_LOCATION}."
+          elif echo "$available" | grep -qx "$NR_MONITOR_LOCATION"; then
+            echo "${NR_MONITOR_LOCATION} is available for the monitor resource."
+          else
+            chosen=$(echo "$available" | head -1)
+            echo "::warning title=Monitor region adjusted::${NR_MONITOR_LOCATION} is not available for NewRelic.Observability/monitors. Using ${chosen} instead. Available: $(echo $available | tr '\n' ' ')"
+            echo "NR_MONITOR_LOCATION=${chosen}" >> "$GITHUB_ENV"
+          fi
+
+      # Dos motivos para mirar antes de desplegar:
+      #
+      # 1. Un segundo monitor vinculado a la misma organizacion duplicaria cada
+      #    registro de log. Este workflow es identico en los tres repositorios y
+      #    todos apuntan al mismo resource group y nombre, pero desplegar con OTRO
+      #    nombre mientras existe uno si crearia el segundo.
+      #
+      # 2. Reaplicar el recurso monitor NO es idempotente. Un PUT sobre un
+      #    monitor ya vinculado falla con "ResourceCreationValidateFailed: An
+      #    internal server error occurred", porque el payload de vinculacion de
+      #    la cuenta no se puede reenviar, y menos si difiere algo inmutable como
+      #    la region. Asi que si ya existe, este workflow NO lo toca.
       - name: Look for an existing monitor
+        if: steps.check.outputs.ready == 'true'
         id: existing
+        env:
+          FORCE_REDEPLOY: ${{ inputs.force_redeploy }}
         run: |
           set -euo pipefail
           found=$(az resource list --resource-type "NewRelic.Observability/monitors" \
-            --query "[].{name:name,rg:resourceGroup}" -o json)
+            --query "[].{name:name,rg:resourceGroup,location:location}" -o json)
           count=$(echo "$found" | jq 'length')
           echo "Monitors already present in the subscription: ${count}"
           echo "$found" | jq .
@@ -140,22 +248,38 @@ jobs:
             exit 1
           fi
 
-          if [ "$count" -eq 1 ]; then
-            existing_name=$(echo "$found" | jq -r '.[0].name')
-            existing_rg=$(echo "$found" | jq -r '.[0].rg')
-            if [ "$existing_name" != "$NR_MONITOR_NAME" ] || [ "$existing_rg" != "$NR_RESOURCE_GROUP" ]; then
-              echo "ERROR: a monitor already exists as ${existing_rg}/${existing_name}," >&2
-              echo "but this run would deploy ${NR_RESOURCE_GROUP}/${NR_MONITOR_NAME}." >&2
-              echo "Deploying it would leave TWO monitors and every log would arrive twice." >&2
-              echo "Re-run this workflow with monitor_name=${existing_name} and" >&2
-              echo "resource_group=${existing_rg}, or delete the existing one first." >&2
-              exit 1
-            fi
-            echo "The monitor already exists with the requested name. This run just"
-            echo "reapplies its tag rules, which is idempotent."
+          if [ "$count" -eq 0 ]; then
+            echo "No monitor yet. It will be created."
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
+          existing_name=$(echo "$found" | jq -r '.[0].name')
+          existing_rg=$(echo "$found" | jq -r '.[0].rg')
+          existing_loc=$(echo "$found" | jq -r '.[0].location')
+
+          if [ "$existing_name" != "$NR_MONITOR_NAME" ] || [ "$existing_rg" != "$NR_RESOURCE_GROUP" ]; then
+            echo "ERROR: a monitor already exists as ${existing_rg}/${existing_name}," >&2
+            echo "but this run targets ${NR_RESOURCE_GROUP}/${NR_MONITOR_NAME}." >&2
+            echo "Deploying it would leave TWO monitors and every log would arrive twice." >&2
+            echo "Re-run with monitor_name=${existing_name} and resource_group=${existing_rg}," >&2
+            echo "or delete the existing one first." >&2
+            exit 1
+          fi
+
+          if [ "${FORCE_REDEPLOY:-false}" = "true" ]; then
+            echo "::warning::The monitor already exists in ${existing_loc} and force_redeploy is on. Reapplying it can fail with ResourceCreationValidateFailed: the account linking payload is not replayable."
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "deploy=false" >> "$GITHUB_OUTPUT"
+          echo "The monitor already exists as ${existing_rg}/${existing_name} in ${existing_loc}."
+          echo "Nothing to do: reapplying it is not idempotent, so this run leaves it alone."
+          echo "To change its tag rules, run this workflow manually with force_redeploy=true."
+
       - name: Deploy the New Relic monitor and its tag rules
+        if: steps.check.outputs.ready == 'true' && steps.existing.outputs.deploy == 'true'
         id: deploy
         env:
           NR_ACCOUNT_ID: ${{ secrets.NR_ACCOUNT_ID }}
@@ -173,11 +297,14 @@ jobs:
           echo "monitor_name=$(echo "$outputs" | jq -r .monitorName.value)" >> "$GITHUB_OUTPUT"
           echo "resource_group=$(echo "$outputs" | jq -r .resourceGroupName.value)" >> "$GITHUB_OUTPUT"
 
+      # Usa las variables de entorno y no las salidas del paso anterior: ese paso
+      # se salta cuando el monitor ya existe, y sus salidas estarian vacias.
       - name: Show what is being monitored
+        if: steps.check.outputs.ready == 'true'
         continue-on-error: true
         env:
-          MONITOR: ${{ steps.deploy.outputs.monitor_name }}
-          RG: ${{ steps.deploy.outputs.resource_group }}
+          MONITOR: ${{ env.NR_MONITOR_NAME }}
+          RG: ${{ env.NR_RESOURCE_GROUP }}
         run: |
           set -euo pipefail
           echo "Tag rules in place:"
@@ -188,10 +315,11 @@ jobs:
             --query properties -o json || true
 
       - name: Summary
-        if: always()
+        if: always() && steps.check.outputs.ready == 'true'
         env:
-          MONITOR: ${{ steps.deploy.outputs.monitor_name }}
-          RG: ${{ steps.deploy.outputs.resource_group }}
+          MONITOR: ${{ env.NR_MONITOR_NAME }}
+          RG: ${{ env.NR_RESOURCE_GROUP }}
+          ACTION: ${{ steps.existing.outputs.deploy == 'true' && 'deployed' || 'already existed, left untouched' }}
         run: |
           {
             echo "## Azure Native New Relic Service"
@@ -199,6 +327,7 @@ jobs:
             echo "| Item | Value |"
             echo "|------|-------|"
             echo "| Monitor resource | \`${MONITOR}\` |"
+            echo "| Outcome | ${ACTION} |"
             echo "| Resource group | \`${RG}\` (must NOT be deleted by the destroy workflow) |"
             echo "| Metrics | ${NR_SEND_METRICS} |"
             echo "| Resource logs | ${NR_SEND_RESOURCE_LOGS} |"

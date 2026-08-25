@@ -16,10 +16,10 @@ import org.springframework.security.web.SecurityFilterChain;
 @EnableWebSecurity
 public class SecurityConfig {
 
-    @Value("${api.security.username}")
+    @Value("${app.security.username}")
     private String username;
 
-    @Value("${api.security.password}")
+    @Value("${app.security.password}")
     private String password;
 
     @Bean
