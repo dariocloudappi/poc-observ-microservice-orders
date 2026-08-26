@@ -117,7 +117,7 @@ startup.sh      Startup command de App Service: adjunta el agente si el jar est�
 Salvo los nombres (`ordersvc`, `sqldb-orders`, `microservice-orders`) y lo propio de este
 servicio (las credenciales de entrada, la dependencia `GATEWAY_*` y el paso de esquema), la
 infraestructura es **la misma** que en `poc-microservice-users`: `monitoring.bicep`, `sql.bicep`
-y los tres ficheros de la integración nativa de New Relic son idénticos fichero a fichero.
+y los tres ficheros de la integración nativa de New Relic son idénticos fichero a fichero. 
 
 ---
 
