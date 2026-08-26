@@ -5,6 +5,9 @@ import com.example.ordersapp.config.OutboundHttpLoggingInterceptor;
 import com.example.ordersapp.client.dtos.UserSingleEnvelope;
 import com.example.ordersapp.exceptions.UserNotFoundException;
 import com.example.ordersapp.exceptions.UsersServiceUnavailableException;
+import com.example.ordersapp.observability.Observability;
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.context.Scope;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -17,12 +20,17 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.client.HttpClientErrorException;
 import org.springframework.web.client.RestClientException;
 import org.springframework.web.client.RestTemplate;
+
 import java.time.Duration;
+import java.util.Map;
 
 @Service
 public class UserValidationService {
 
     private static final Logger log = LoggerFactory.getLogger(UserValidationService.class);
+
+    private static final String DEPENDENCY = "tyk-gateway";
+
     private final RestTemplate restTemplate;
 
     /** Base de la API de usuarios TAL COMO SE PUBLICA en el gateway. */
@@ -58,33 +66,123 @@ public class UserValidationService {
                 // trae nombre y email de una persona. Se registran la url, el
                 // codigo y la duracion, nunca el payload. La cabecera
                 // Authorization tampoco se registra, va en SENSITIVE_HEADERS.
-                .additionalInterceptors(new OutboundHttpLoggingInterceptor("tyk-gateway", false))
+                .additionalInterceptors(new OutboundHttpLoggingInterceptor(DEPENDENCY, false))
                 .build();
         // Se normaliza aqui una sola vez para no repetir la concatenacion.
         this.usersApiBaseUrl = trimSlash(gatewayUrl) + "/" + usersPath.replaceAll("^/+", "");
     }
 
+    /**
+     * Valida el usuario contra poc-microservice-users a traves del gateway.
+     *
+     * PROPAGACION ENTRE SERVICIOS
+     * ---------------------------
+     * La llamada se envuelve en un ambito de Baggage. Es lo unico que hace que
+     * el contexto de negocio de este servicio sea visible en el siguiente: los
+     * atributos de span se quedan en el span donde se ponen y no cruzan el
+     * cable. El Baggage viaja en la cabecera baggage del W3C, el agente lo
+     * inyecta al salir y lo extrae al entrar, y el filtro de users lo adopta
+     * como atributos propios.
+     *
+     * Resultado practico: en la traza de users se puede ver que la peticion
+     * venia de orders y para que usuario, sin tocar el codigo de users.
+     */
     public UserDto validateUser(String userId) {
         String endpoint = usersApiBaseUrl + "/users/" + userId;
-        log.debug("Validando usuario {} contra {}", userId, endpoint);
-        try {
+
+        Observability.attr("user.id", userId);
+        Observability.attr("http.client.dependency", DEPENDENCY);
+        Observability.attr("users_api.endpoint", endpoint);
+
+        log.atInfo()
+                .addKeyValue("user.id", userId)
+                .addKeyValue("http.client.dependency", DEPENDENCY)
+                .addKeyValue("users_api.endpoint", endpoint)
+                .log("Validando usuario {} a traves del gateway", userId);
+
+        long start = System.nanoTime();
+
+        try (Scope ignored = Observability.propagate(Map.of(
+                "caller.service", "poc-microservice-orders",
+                "caller.user_id", userId))) {
+
             ResponseEntity<UserSingleEnvelope> response =
                     restTemplate.getForEntity(endpoint, UserSingleEnvelope.class);
+
+            long elapsedMs = elapsedMs(start);
+            Observability.attr("users_api.status_code", response.getStatusCode().value());
+            Observability.attr("users_api.duration_ms", elapsedMs);
+
             UserSingleEnvelope envelope = response.getBody();
             if (envelope == null || envelope.getData() == null) {
-                log.error("Respuesta vacia o sin data para usuario {}", userId);
+                Observability.attr("error.type", "EmptyUsersResponse");
+                // ERROR de verdad: el upstream contesto 2xx con un cuerpo que
+                // incumple el contrato. Es un fallo de integracion, no del
+                // cliente.
+                log.atError()
+                        .addKeyValue("user.id", userId)
+                        .addKeyValue("users_api.duration_ms", elapsedMs)
+                        .addKeyValue("error.type", "EmptyUsersResponse")
+                        .log("Respuesta vacia o sin data al validar el usuario {}", userId);
                 throw new UsersServiceUnavailableException("Respuesta invalida del servicio de usuarios");
             }
-            log.debug("Usuario validado: id={} name={}", userId, envelope.getData().getName());
+
+            // El nombre NO se registra: es un dato personal y no aporta nada al
+            // diagnostico. Basta con saber que la validacion fue correcta.
+            log.atInfo()
+                    .addKeyValue("user.id", userId)
+                    .addKeyValue("users_api.status_code", response.getStatusCode().value())
+                    .addKeyValue("users_api.duration_ms", elapsedMs)
+                    .log("Usuario validado correctamente: id={} en {} ms", userId, elapsedMs);
             return envelope.getData();
+
         } catch (HttpClientErrorException e) {
+            long elapsedMs = elapsedMs(start);
+            Observability.attr("users_api.status_code", e.getStatusCode().value());
+            Observability.attr("users_api.duration_ms", elapsedMs);
+
             if (e.getStatusCode() == HttpStatus.NOT_FOUND) {
-                throw new UserNotFoundException("Usuario '" + userId + "' no encontrado");
+                // WARN: el usuario no existe. Es una respuesta legitima del
+                // upstream, no una averia.
+                Observability.attr("error.type", "UserNotFound");
+                log.atWarn()
+                        .addKeyValue("user.id", userId)
+                        .addKeyValue("users_api.status_code", 404)
+                        .addKeyValue("users_api.duration_ms", elapsedMs)
+                        .addKeyValue("error.type", "UserNotFound")
+                        .log("El servicio de usuarios no conoce al usuario {}", userId);
+                throw new UserNotFoundException("Usuario " + userId + " no encontrado");
             }
-            log.error("Error HTTP {} al validar usuario {}", e.getStatusCode(), userId);
+
+            Observability.attr("error.type", e.getClass().getSimpleName());
+            Span.current().recordException(e);
+            log.atError()
+                    .addKeyValue("user.id", userId)
+                    .addKeyValue("users_api.status_code", e.getStatusCode().value())
+                    .addKeyValue("users_api.duration_ms", elapsedMs)
+                    .addKeyValue("error.type", e.getClass().getSimpleName())
+                    .setCause(e)
+                    .log("Error HTTP {} al validar el usuario {} tras {} ms",
+                            e.getStatusCode(), userId, elapsedMs);
             throw new UsersServiceUnavailableException("Error al contactar el servicio de usuarios", e);
+
         } catch (RestClientException e) {
-            log.error("Error de conexion al servicio de usuarios", e);
+            long elapsedMs = elapsedMs(start);
+            Observability.attr("users_api.duration_ms", elapsedMs);
+            Observability.attr("error.type", e.getClass().getSimpleName());
+            Span.current().recordException(e);
+
+            // Distinguir esto del caso anterior importa: aqui no hubo respuesta
+            // en absoluto, o sea gateway caido, DNS o timeout. Es el sintoma de
+            // una averia de infraestructura, no de un pedido concreto.
+            log.atError()
+                    .addKeyValue("user.id", userId)
+                    .addKeyValue("users_api.endpoint", endpoint)
+                    .addKeyValue("users_api.duration_ms", elapsedMs)
+                    .addKeyValue("error.type", e.getClass().getSimpleName())
+                    .setCause(e)
+                    .log("Sin respuesta del servicio de usuarios tras {} ms: {}",
+                            elapsedMs, e.getMessage());
             throw new UsersServiceUnavailableException("Servicio de usuarios no disponible", e);
         }
     }
@@ -100,5 +198,9 @@ public class UserValidationService {
 
     private static String trimSlash(String value) {
         return value.endsWith("/") ? value.substring(0, value.length() - 1) : value;
+    }
+
+    private static long elapsedMs(long startNanos) {
+        return (System.nanoTime() - startNanos) / 1_000_000;
     }
 }

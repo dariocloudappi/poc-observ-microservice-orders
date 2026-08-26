@@ -268,7 +268,7 @@ jobs:
           # The .bicepparam file declares its own template through "using",
           # so --template-file must not be passed here.
           outputs=$(az deployment sub create \
-            --name "orders-${GITHUB_RUN_ID}" \
+            --name "orders-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             --location "$AZURE_LOCATION" \
             --parameters infra/main.bicepparam \
             --query properties.outputs -o json)

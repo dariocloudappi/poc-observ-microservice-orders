@@ -183,8 +183,15 @@ resource rg 'Microsoft.Resources/resourceGroups@2024-03-01' = {
   tags: tags
 }
 
+// Los nombres de despliegue de los modulos llevan un sufijo unico a proposito.
+// Con un nombre fijo, un despliegue de modulo que se queda colgado bloquea TODOS
+// los siguientes durante 7 dias con:
+//   DeploymentActive: ... cannot be saved, because this would overwrite an
+//   existing deployment which is still active ... will expire at <+7 dias>
+// uniqueString(deployment().name) deriva del nombre del despliegue externo, que
+// el pipeline ya hace unico por ejecucion.
 module monitoring './modules/monitoring.bicep' = {
-  name: 'monitoring'
+  name: 'monitoring-${uniqueString(deployment().name)}'
   scope: rg
   params: {
     location: location
@@ -196,7 +203,7 @@ module monitoring './modules/monitoring.bicep' = {
 }
 
 module sql './modules/sql.bicep' = {
-  name: 'sql'
+  name: 'sql-${uniqueString(deployment().name)}'
   scope: rg
   params: {
     location: location
@@ -213,7 +220,7 @@ module sql './modules/sql.bicep' = {
 }
 
 module app './modules/appservice.bicep' = {
-  name: 'appservice'
+  name: 'appservice-${uniqueString(deployment().name)}'
   scope: rg
   params: {
     location: location

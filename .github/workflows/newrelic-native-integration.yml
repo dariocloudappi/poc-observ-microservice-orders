@@ -289,7 +289,7 @@ jobs:
         run: |
           set -euo pipefail
           outputs=$(az deployment sub create \
-            --name "newrelic-${GITHUB_RUN_ID}" \
+            --name "newrelic-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             --location "$AZURE_LOCATION" \
             --parameters infra/newrelic.bicepparam \
             --query properties.outputs -o json)

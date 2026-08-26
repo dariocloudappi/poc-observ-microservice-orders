@@ -92,8 +92,15 @@ resource rg 'Microsoft.Resources/resourceGroups@2024-03-01' = {
   tags: tags
 }
 
+// Los nombres de despliegue de los modulos llevan un sufijo unico a proposito.
+// Con un nombre fijo, un despliegue de modulo que se queda colgado bloquea TODOS
+// los siguientes durante 7 dias con:
+//   DeploymentActive: ... cannot be saved, because this would overwrite an
+//   existing deployment which is still active ... will expire at <+7 dias>
+// uniqueString(deployment().name) deriva del nombre del despliegue externo, que
+// el pipeline ya hace unico por ejecucion.
 module monitor './modules/newrelic-monitor.bicep' = {
-  name: 'newrelic-monitor'
+  name: 'newrelic-monitor-${uniqueString(deployment().name)}'
   scope: rg
   params: {
     // Deliberadamente monitorLocation y no location: el tipo de recurso solo

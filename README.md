@@ -81,12 +81,13 @@ de datos se crea antes que la aplicación.
 ```
 src/main/java/com/example/ordersapp/
 ├── client/dtos/    ApiErrorDto, UserDto, UserSingleEnvelope (respuestas de users)
-├── config/         SecurityConfig, WebConfig, TraceIdInterceptor
+├── config/         SecurityConfig, HttpClientConfig, OutboundHttpLoggingInterceptor
 ├── controllers/    OrderController, SystemController
 ├── exceptions/     GlobalExceptionHandler y excepciones de dominio
-├── filters/        RequestLoggingFilter (log de entrada/salida + atributos de traza)
+├── filters/        RequestLoggingFilter (log de entrada/salida, X-Trace-Id y Baggage)
 ├── logging/        LevelMdcTurboFilter (expone el nivel como atributo en New Relic)
 ├── models/         Order, OrderItem, OrderStatus
+├── observability/  Observability (anota span y MDC a la vez, y propaga Baggage)
 ├── repository/     OrderRepository (Spring Data JPA)
 ├── services/       OrderService, UserValidationService
 └── system/         SystemService y su respuesta de /status
@@ -1679,7 +1680,12 @@ Son aceptables en un PoC y no lo serían en producción:
    de Azure**. Lo correcto sería VNet + private endpoint, que exige plan Standard o superior.
 4. **`/status` llama a `httpbin.org`** en cada invocación: una dependencia de terceros no
    controlada dentro de un endpoint de estado. Conviene quitarlo antes de cualquier uso serio.
-5. **La cadena de credenciales está duplicada**: `API_*` aquí debe coincidir con
+5. **El workspace de Log Analytics y el servidor SQL tienen el acceso público de red
+   habilitado**, porque los runners de GitHub están fuera de cualquier VNet y son quienes
+   consultan el workspace y aplican el esquema. Cerrarlo exige Private Link **más** runners
+   autohospedados. Está anotado en cada plantilla junto a la propiedad, con la referencia `S6329`
+   del analizador que lo marca.
+6. **La cadena de credenciales está duplicada**: `BASIC_AUTH_*` aquí debe coincidir con
    `UPSTREAM_ORDERS_BASIC_*` en el gateway, y `GATEWAY_BASIC_*` con `USERNAME_API_USERS` /
    `PASSWORD_API_USERS` del
    de usuarios. Cualquier rotación hay que hacerla en los dos repositorios a la vez.

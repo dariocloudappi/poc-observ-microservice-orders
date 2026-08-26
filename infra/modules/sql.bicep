@@ -61,6 +61,12 @@ resource sqlServer 'Microsoft.Sql/servers@2023-08-01-preview' = {
     administratorLoginPassword: administratorPassword
     version: '12.0'
     minimalTlsVersion: '1.2'
+    // S6329: acceso publico de red. Es DELIBERADO: la web app corre en el App
+    // Service compartido SIN integracion con VNet, que requiere plan Standard o
+    // superior, asi que alcanza la base de datos por el endpoint publico. La
+    // exposicion se limita con la regla de firewall de solo servicios de Azure
+    // que se declara justo debajo. La alternativa correcta, VNet mas private
+    // endpoint, esta documentada como limitacion conocida en el README.
     publicNetworkAccess: 'Enabled'
   }
 }
@@ -95,8 +101,8 @@ resource database 'Microsoft.Sql/servers/databases@2023-08-01-preview' = {
   parent: sqlServer
   name: databaseName
   location: location
-  tags: tags
   sku: skuMap[sqlSkuName]
+  tags: tags
   properties: union(baseDatabaseProperties, serverlessProperties)
 }
 
@@ -112,12 +118,6 @@ resource databaseDiagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-01-p
   scope: database
   properties: {
     workspaceId: logAnalyticsWorkspaceId
-    // Tablas dedicadas. El valor por defecto es AzureDiagnostics, y con el TODO
-    // acaba en la tabla generica AzureDiagnostics: la tabla
-    // SQLSecurityAuditEvents se queda vacia y las columnas pierden su nombre
-    // (Statement pasa a statement_s, ClientIp a client_ip_s...). Sin esta linea
-    // la auditoria se genera pero no se puede consultar como esta documentado.
-    logAnalyticsDestinationType: 'Dedicated'
     logs: [
       {
         categoryGroup: 'allLogs'
