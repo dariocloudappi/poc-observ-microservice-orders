@@ -111,6 +111,33 @@ public class GlobalExceptionHandler {
         return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(body);
     }
 
+    /**
+     * Error provocado desde /force-errors.
+     *
+     * Reutiliza annotateSpan y errorResponse para que la telemetria Y el cuerpo
+     * de la respuesta sean IDENTICOS a los de un error real de este servicio: si
+     * es 5xx se registra la excepcion en el span y su status pasa a ERROR. Es lo
+     * que hace que sirva para probar una alerta de verdad.
+     */
+    @ExceptionHandler(ForcedErrorException.class)
+    public ResponseEntity<Map<String, Object>> handleForcedError(ForcedErrorException ex) {
+        HttpStatus status = HttpStatus.valueOf(ex.getStatus());
+        boolean serverFault = status.is5xxServerError();
+
+        // Marca que permite separar el ruido de las demos de los errores reales.
+        Observability.attr("error.forced", true);
+        annotateSpan(ex, status, "FORCED_ERROR", serverFault);
+
+        var event = serverFault ? log.atError() : log.atWarn();
+        event.addKeyValue("error.type", ex.getClass().getSimpleName())
+                .addKeyValue("error.code", "FORCED_ERROR")
+                .addKeyValue("error.forced", true)
+                .addKeyValue("http.status_code", status.value())
+                .log("Error provocado {}: {}", status.value(), ex.getMessage());
+
+        return errorResponse(status, "Forced Error", ex.getMessage());
+    }
+
     @ExceptionHandler(Exception.class)
     public ResponseEntity<Map<String, Object>> handleGeneric(Exception ex) {
         annotateSpan(ex, HttpStatus.INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", true);

@@ -48,6 +48,15 @@ app:
     # despliegue incompleto quedaba abierto con una credencial conocida.
     username: ${BASIC_AUTH_USER}
     password: ${BASIC_AUTH_PASSWORD}
+  force-errors:
+    # Endpoint /force-errors, que provoca el codigo de error que se le pida.
+    # Existe para poder probar alertas y dashboards sin esperar a que algo se
+    # rompa de verdad.
+    #
+    # Va detras del Basic Auth como el resto, pero permite a cualquier consumidor
+    # autenticado provocar 5xx a voluntad. Con false responde 404, para no
+    # revelar que la ruta existe.
+    enabled: ${FORCE_ERRORS_ENABLED:true}
 
 server:
   port: ${PORT:8080}

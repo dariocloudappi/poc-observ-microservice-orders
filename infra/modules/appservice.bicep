@@ -54,6 +54,9 @@ param environmentName string
 param serviceNamespace string
 param logLevel string
 
+@description('Habilita el endpoint /force-errors, que provoca el codigo de error que se le pida. Permite a cualquier consumidor autenticado provocar 5xx, asi que con false responde 404 y la ruta queda oculta')
+param forceErrorsEnabled bool = true
+
 @description('Log level of the Hibernate SQL logger. DEBUG ships every executed statement to New Relic as a log record')
 param sqlLogLevel string = 'INFO'
 
@@ -154,6 +157,14 @@ var securitySettings = [
   {
     name: 'BASIC_AUTH_PASSWORD'
     value: basicAuthPassword
+  }
+  {
+    // Leida por application.yaml como app.force-errors.enabled.
+    // Va aqui, con las de seguridad, y no con las de observabilidad: es una
+    // decision de EXPOSICION, no de telemetria. El endpoint deja provocar 5xx a
+    // cualquier consumidor autenticado.
+    name: 'FORCE_ERRORS_ENABLED'
+    value: string(forceErrorsEnabled)
   }
 ]
 
@@ -280,7 +291,7 @@ var otelEnabledSettings = [
   // orders and users visible.
   {
     name: 'OTEL_INSTRUMENTATION_HTTP_SERVER_CAPTURE_REQUEST_HEADERS'
-    value: 'content-type,user-agent,x-forwarded-for,traceparent'
+    value: 'content-type,user-agent,x-forwarded-for,traceparent,baggage'
   }
   {
     name: 'OTEL_INSTRUMENTATION_HTTP_SERVER_CAPTURE_RESPONSE_HEADERS'
@@ -288,11 +299,11 @@ var otelEnabledSettings = [
   }
   {
     name: 'OTEL_INSTRUMENTATION_HTTP_CLIENT_CAPTURE_REQUEST_HEADERS'
-    value: 'content-type,user-agent,traceparent'
+    value: 'content-type,user-agent,traceparent,baggage,x-poc-source'
   }
   {
     name: 'OTEL_INSTRUMENTATION_HTTP_CLIENT_CAPTURE_RESPONSE_HEADERS'
-    value: 'content-type,server'
+    value: 'content-type,server,x-trace-id'
   }
   // ---------------------------------------------------------------------
   // Database telemetry over OTLP
@@ -309,13 +320,59 @@ var otelEnabledSettings = [
     value: 'true'
   }
   {
+    // Spans de CONTROLADOR automaticos, sin listar nada.
+    //
+    // Es la mejor opcion disponible para esa capa: el agente conoce Spring MVC,
+    // asi que instrumenta el metodo del controlador el solo y cubre tambien los
+    // controladores que se anadan en el futuro. No hay lista que mantener.
+    //
+    // Por eso OTEL_INSTRUMENTATION_METHODS_INCLUDE, mas abajo, ya NO enumera
+    // controladores: solo la capa de servicio, que es la que ningun framework
+    // puede instrumentar por si mismo porque son clases propias.
+    //
+    // CAVEAT: la propiedad lleva "experimental" en el nombre. Puede cambiar entre
+    // versiones del agente, asi que al subir otel-agent.version conviene
+    // comprobar que los spans de controlador siguen apareciendo.
+    // Ref: https://opentelemetry.io/docs/zero-code/java/agent/disable/
+    name: 'OTEL_INSTRUMENTATION_COMMON_EXPERIMENTAL_CONTROLLER_TELEMETRY_ENABLED'
+    value: 'true'
+  }
+  {
     // ------------------------------------------------------------------
     // Spans por capa de la aplicacion, SIN tocar el codigo
     // ------------------------------------------------------------------
+    // El agente instrumenta el servidor HTTP, JDBC y el cliente HTTP, pero NO
+    // los metodos de la aplicacion. Sin esto la traza salta del span de
+    // servidor directamente al SELECT y todo lo de en medio aparece como
+    // "Uninstrumented time", sin decir si el tiempo se fue en el controlador,
+    // en el servicio o esperando una conexion del pool.
+    //
+    // Esta es la via ZERO-CODE. La alternativa era la anotacion @WithSpan, que
+    // obliga a anadir la dependencia opentelemetry-instrumentation-annotations
+    // y a tocar cada metodo. Se descarto: su unica ventaja sobre esta
+    // configuracion es @SpanAttribute, que captura argumentos como atributos, y
+    // aqui es redundante porque cada metodo ya llama a Observability.attr con
+    // sus claves de negocio.
+    //
+    // Aqui SOLO va la capa de servicio. Los controladores los cubre
+    // OTEL_INSTRUMENTATION_COMMON_EXPERIMENTAL_CONTROLLER_TELEMETRY_ENABLED, mas
+    // arriba, que no necesita lista. Estas clases son propias y ningun framework
+    // las conoce, asi que enumerarlas es la unica via.
+    //
+    // NO admite comodines: la sintaxis documentada es Clase[metodo,metodo] y no
+    // hay patrones ni globs. Comprobado en la documentacion oficial.
+    // Ref: https://opentelemetry.io/docs/zero-code/java/agent/annotations/
+    //
+    // MANTENIMIENTO: los nombres son cadenas, no referencias. Renombrar una
+    // clase o un metodo NO da error de compilacion, simplemente dejan de
+    // aparecer los spans. Si una capa desaparece de las trazas, mirar aqui
+    // primero.
+    //
+    // validateUser es el metodo mas interesante de este micro: es el salto
+    // orders -> tyk -> users, y con su span se ve cuanto de la latencia total
+    // se va en validar el usuario frente a consultar las ordenes.
     name: 'OTEL_INSTRUMENTATION_METHODS_INCLUDE'
     value: join([
-      'com.example.ordersapp.controllers.OrderController[getOrders,getOrder,createOrder,updateOrder,deleteOrder]'
-      'com.example.ordersapp.controllers.SystemController[getStatus]'
       'com.example.ordersapp.services.OrderService[findByUserId,findByUserIdAndStatus,findById,create,update,delete]'
       'com.example.ordersapp.services.UserValidationService[validateUser]'
       'com.example.ordersapp.system.SystemService[getStatus,checkDatabase,checkHttp,checkExternalApiUsers]'
