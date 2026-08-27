@@ -309,6 +309,19 @@ var otelEnabledSettings = [
     value: 'true'
   }
   {
+    // ------------------------------------------------------------------
+    // Spans por capa de la aplicacion, SIN tocar el codigo
+    // ------------------------------------------------------------------
+    name: 'OTEL_INSTRUMENTATION_METHODS_INCLUDE'
+    value: join([
+      'com.example.ordersapp.controllers.OrderController[getOrders,getOrder,createOrder,updateOrder,deleteOrder]'
+      'com.example.ordersapp.controllers.SystemController[getStatus]'
+      'com.example.ordersapp.services.OrderService[findByUserId,findByUserIdAndStatus,findById,create,update,delete]'
+      'com.example.ordersapp.services.UserValidationService[validateUser]'
+      'com.example.ordersapp.system.SystemService[getStatus,checkDatabase,checkHttp,checkExternalApiUsers]'
+    ], ';')
+  }
+  {
     // Bridges Micrometer to OTLP, so the Actuator metrics of the connection
     // pool (hikaricp.connections.*, jdbc.connections.*) reach New Relic as
     // metrics instead of staying inside the app.
