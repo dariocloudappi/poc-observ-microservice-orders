@@ -40,22 +40,21 @@ gateway:
 
 app:
   security:
-    # Credenciales que ESTE servicio exige a quien le llama. Mismo nombre que en
-    # microservice-users, a proposito: es el mismo concepto en los dos.
+    # Credenciales que este servicio exige a quien le llama. Se emplea el mismo
+    # nombre que en microservice-users por tratarse del mismo concepto.
     #
-    # SIN valor por defecto. Con ${BASIC_AUTH_USER:admin} el servicio arrancaba
-    # con admin/password si la variable faltaba, en lugar de fallar, y un
-    # despliegue incompleto quedaba abierto con una credencial conocida.
+    # Sin valor por defecto: con ${BASIC_AUTH_USER:admin} el servicio arrancaria
+    # con admin/password cuando falte la variable, en lugar de fallar, y un
+    # despliegue incompleto quedaria accesible con una credencial conocida.
     username: ${BASIC_AUTH_USER}
     password: ${BASIC_AUTH_PASSWORD}
   force-errors:
-    # Endpoint /force-errors, que provoca el codigo de error que se le pida.
-    # Existe para poder probar alertas y dashboards sin esperar a que algo se
-    # rompa de verdad.
+    # Endpoint /force-errors, que devuelve el codigo de error solicitado. Sirve
+    # para validar alertas y paneles sin esperar a un fallo real.
     #
-    # Va detras del Basic Auth como el resto, pero permite a cualquier consumidor
-    # autenticado provocar 5xx a voluntad. Con false responde 404, para no
-    # revelar que la ruta existe.
+    # Queda detras del Basic Auth, como el resto, pero permite a cualquier
+    # consumidor autenticado provocar respuestas 5xx. Con false responde 404,
+    # para no revelar que la ruta existe.
     enabled: ${FORCE_ERRORS_ENABLED:true}
 
 server:
@@ -80,13 +79,12 @@ logging:
   level:
     root: INFO
     com.example: ${LOG_LEVEL:INFO}
-    # DEBUG por defecto, como hasta ahora, pero ahora la variable LOG_LEVEL
-    # manda de verdad: con el valor fijo, este logger mas especifico ganaba
-    # siempre a com.example y LOG_LEVEL no tenia ningun efecto sobre la
-    # aplicacion.
+    # DEBUG por defecto, pero gobernado por la variable LOG_LEVEL. Con un valor
+    # fijo, este logger, mas especifico, prevalece sobre com.example y LOG_LEVEL
+    # no surte efecto.
     com.example.ordersapp: ${LOG_LEVEL:DEBUG}
-    # Every statement Hibernate executes, as a log record correlated with its
-    # trace. Set SQL_LOG_LEVEL=DEBUG to enable it.
+    # Cada sentencia que ejecuta Hibernate, como registro de log correlacionado
+    # con su traza. Se activa con SQL_LOG_LEVEL=DEBUG.
     # The logger name is declared here and not as a LOGGING_LEVEL_ORG_HIBERNATE_SQL
     # app setting on purpose: relaxed binding lowercases environment variable
     # names, and "org.hibernate.sql" is a different logger than "org.hibernate.SQL".

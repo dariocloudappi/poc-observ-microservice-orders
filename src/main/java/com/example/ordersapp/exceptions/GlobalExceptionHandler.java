@@ -20,16 +20,15 @@ import java.util.stream.Collectors;
  * Ademas de traducir la excepcion a una respuesta, cada handler la registra en
  * el span.
  *
- * Por que importa: un @RestControllerAdvice CONSUME la excepcion. Al no
- * propagarse, el agente no la ve y el span queda sin marca de error. El
- * sintoma era que se devolvia un 500 o un 503 y la traza aparecia
- * aparentemente correcta, sin excepcion asociada y sin poder agrupar por tipo
- * de error.
+ * Un @RestControllerAdvice consume la excepcion, de modo que el agente no la
+ * observa y el span queda sin marca de error: la traza aparece correcta aunque
+ * la respuesta sea un 500 o un 503, sin excepcion asociada y sin posibilidad de
+ * agrupar por tipo de error.
  *
- * Los 4xx NO se marcan como error del span a proposito: son errores del
- * cliente. Si se marcasen, la tasa de error del servicio incluiria cada 404 y
- * dejaria de servir para detectar averias reales. El 503 de users caido SI se
- * marca: ahi la averia es real y ajena al cliente.
+ * Los 4xx no se marcan como error del span porque son errores del cliente. Si
+ * se marcasen, la tasa de error del servicio incluiria cada 404 y dejaria de
+ * indicar averias reales. El 503 por indisponibilidad de users si se marca: la
+ * averia es real y ajena al cliente.
  */
 @RestControllerAdvice
 public class GlobalExceptionHandler {
@@ -114,17 +113,17 @@ public class GlobalExceptionHandler {
     /**
      * Error provocado desde /force-errors.
      *
-     * Reutiliza annotateSpan y errorResponse para que la telemetria Y el cuerpo
-     * de la respuesta sean IDENTICOS a los de un error real de este servicio: si
-     * es 5xx se registra la excepcion en el span y su status pasa a ERROR. Es lo
-     * que hace que sirva para probar una alerta de verdad.
+     * Reutiliza annotateSpan y errorResponse para que la telemetria y el cuerpo
+     * de la respuesta sean identicos a los de un error real de este servicio: en
+     * un 5xx se registra la excepcion en el span y su status pasa a ERROR,
+     * condicion necesaria para validar una alerta.
      */
     @ExceptionHandler(ForcedErrorException.class)
     public ResponseEntity<Map<String, Object>> handleForcedError(ForcedErrorException ex) {
         HttpStatus status = HttpStatus.valueOf(ex.getStatus());
         boolean serverFault = status.is5xxServerError();
 
-        // Marca que permite separar el ruido de las demos de los errores reales.
+        // Marca que permite distinguir estos errores de los reales.
         Observability.attr("error.forced", true);
         annotateSpan(ex, status, "FORCED_ERROR", serverFault);
 

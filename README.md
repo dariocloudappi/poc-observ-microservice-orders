@@ -650,7 +650,7 @@ En métricas se recogen **dos** de las tres categorías:
 |-----------|----------|--------|
 | `Basic` | DTU, almacenamiento, sesiones, workers, deadlocks, `availability` y los contadores de conexión (`connection_successful`, `connection_failed`, `blocked_by_firewall`) | Activa |
 | `InstanceAndAppAdvanced` | CPU y memoria del motor (`sql_instance_cpu_percent`, `sql_instance_memory_percent`) y uso de tempdb | Activa |
-| `WorkloadManagement` | Métricas `wlg_*` de grupos de carga | **Fuera a propósito**: solo aplica a data warehouses, no a una base de datos única |
+| `WorkloadManagement` | Métricas `wlg_*` de grupos de carga | **Excluida**: solo aplica a data warehouses, no a una base de datos única |
 
 ### 5.3.1 No existe un log de arranque de Azure SQL Database
 
@@ -1187,7 +1187,7 @@ le llama; `GATEWAY_*` es lo que este servicio **presenta** al gateway de Tyk.
 | `OTEL_SERVICE_NAME` | Nombre del servicio en New Relic | `microservice-orders` |
 | `ENVIRONMENT` | Atributo `deployment.environment` | `poc` |
 | `SERVICE_NAMESPACE` | Atributo `service.namespace`, común a todo el PoC | `poc-observability` |
-| `LOG_LEVEL` | Nivel de log de la aplicación. Ojo: el paquete propio `com.example.ordersapp` arranca en `DEBUG`, así que sin tocar esta variable se envía bastante más volumen que en `microservice-users` | `DEBUG` |
+| `LOG_LEVEL` | Nivel de log de la aplicación. El paquete propio `com.example.ordersapp` arranca en `DEBUG`, de modo que sin modificar esta variable se envía más volumen que en `microservice-users` | `DEBUG` |
 | `SQL_LOG_LEVEL` | Nivel del logger `org.hibernate.SQL`. `DEBUG` envía cada sentencia a New Relic como log | `INFO` |
 | `LOG_RETENTION_DAYS` | Retención de Log Analytics | `30` |
 | `LOG_DAILY_QUOTA_GB` | Tope diario de ingesta | `1` |
@@ -1509,7 +1509,7 @@ Después de que exista el monitor:
    dos veces. El workspace se sigue creando: uno sin ingesta no cuesta nada.
 2. Comprueba sobre el servidor SQL de orders que aparece un Diagnostic Setting hacia New Relic
    creado por Azure.
-3. En la web app **no** debe aparecer esa entrada: está excluida a propósito con la etiqueta
+3. En la web app **no** debe aparecer esa entrada: está excluida de forma deliberada mediante la etiqueta
    `newrelicLogs=exclude`, porque el agente OTel ya manda esos logs y llegarían dos veces. Sus
    **métricas** de plataforma sí se recogen, que esas el agente no las ve.
 
@@ -1645,7 +1645,7 @@ El tag `createdAt` se refresca en cada despliegue, así que redesplegar reinicia
 limpieza programada.
 
 `rg-newrelic-shared`, el del monitor nativo, **no** se borra con el PoC: es compartido con el
-otro microservicio y sobrevive a propósito. La limpieza programada filtra por
+otro microservicio y se conserva de forma deliberada. La limpieza programada filtra por
 `project=poc-microservice-orders` y ese grupo lleva `project=poc-observability`, así que queda
 fuera del barrido.
 

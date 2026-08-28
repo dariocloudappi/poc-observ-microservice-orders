@@ -79,10 +79,10 @@ jobs:
   # ejecutarlo en cada despliegue solo reaplica las tag rules. El recurso vive
   # en rg-newrelic-shared y sobrevive al destroy del PoC.
   #
-  # continue-on-error a proposito: es infraestructura compartida y opcional. Si
-  # faltan los secrets NR_ACCOUNT_ID / NR_ORGANIZATION_ID / NR_USER_EMAIL, este
-  # job sale en rojo con el mensaje de que falta configurarlos, pero NO tumba el
-  # despliegue de la aplicacion.
+  # continue-on-error porque es infraestructura compartida y opcional. Si faltan
+  # los secrets NR_ACCOUNT_ID / NR_ORGANIZATION_ID / NR_USER_EMAIL, el job
+  # termina en rojo indicando que falta configurarlos, sin detener el despliegue
+  # de la aplicacion.
   newrelic-monitor:
     name: Ensure the New Relic native integration
     uses: ./.github/workflows/newrelic-native-integration.yml
@@ -125,10 +125,11 @@ jobs:
 
       - name: Validate non secret configuration
         run: |
-          # AVISO y no error: hay un ciclo de dependencias en el arranque del
-          # PoC. El gateway necesita la url de orders para enrutar, y orders
-          # necesita la url del gateway para llamar a users. Se rompe dejando que
-          # orders se despliegue sin ella la primera vez.
+          # Advertencia y no error, porque en el arranque del PoC existe un
+          # ciclo de dependencias: el gateway necesita la url de orders para
+          # enrutar y orders necesita la url del gateway para llamar a users. Se
+          # resuelve permitiendo que orders se despliegue sin ella la primera
+          # vez.
           if [ -z "$GATEWAY_BASE_URL" ]; then
             echo "GATEWAY_BASE_URL is not set. It will be discovered from Azure after the login,"
             echo "looking for the container app tagged project=poc-tyk-api-gateway."
@@ -220,11 +221,10 @@ jobs:
       # La url del gateway NO se pega a mano. Se resuelve preguntando a Azure por
       # el Container App etiquetado como project=poc-tyk-api-gateway.
       #
-      # Por que no vale una variable de repositorio fija: el FQDN de Container
-      # Apps incluye un dominio generado por el entorno, y el entorno se recrea
-      # con cada destroy del PoC. Una url pegada a mano se queda obsoleta en cada
-      # ciclo de destruccion, y el sintoma es que todos los pedidos empiezan a
-      # dar 503 sin que nadie haya cambiado nada.
+      # Una variable de repositorio fija no sirve: el FQDN de Container Apps
+      # incluye un dominio generado por el entorno, y el entorno se recrea con
+      # cada destroy del PoC. Una url fijada a mano queda obsoleta en cada ciclo
+      # de destruccion y todos los pedidos pasan a responder 503.
       #
       # La variable de repositorio GATEWAY_BASE_URL sigue funcionando como
       # override manual: si tiene valor, gana y no se descubre nada.

@@ -79,9 +79,9 @@ public class RequestLoggingFilter extends OncePerRequestFilter{
         MDC.put("http.url", path);
         MDC.put("url.query", query);
 
-        // El metodo y la ruta viajan dos veces a proposito: dentro del mensaje,
-        // para que sea legible tal cual, y como atributos estructurados, que son
-        // los que permiten filtrar y agrupar en New Relic.
+        // El metodo y la ruta se emiten dos veces: en el mensaje, para que sea
+        // legible por si mismo, y como atributos estructurados, que son los que
+        // permiten filtrar y agrupar en New Relic.
         log.atInfo()
                 .addKeyValue("http.method", method)
                 .addKeyValue("http.target", path)

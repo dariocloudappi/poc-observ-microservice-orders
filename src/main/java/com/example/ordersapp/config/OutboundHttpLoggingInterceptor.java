@@ -32,21 +32,19 @@ import java.util.TreeSet;
  *
  * CABECERAS
  * ---------
- * Se emiten como atributos INDIVIDUALES, http.request.header.&lt;nombre&gt;, y no
- * como un unico texto con el mapa entero. La diferencia es practica: sobre
- * atributos individuales se puede hacer FACET y WHERE en NRQL; sobre un blob
- * "{a=1, b=2}" solo se puede buscar por subcadena.
+ * Se emiten como atributos individuales, http.request.header.&lt;nombre&gt;, y no
+ * como un unico texto con el mapa completo, porque sobre atributos individuales
+ * se puede aplicar FACET y WHERE en NRQL, mientras que sobre un valor
+ * "{a=1, b=2}" solo cabe la busqueda por subcadena.
  *
- * De las cabeceras sensibles no se registra el VALOR, pero si el NOMBRE, en
- * http.request.headers_redacted. Asi se puede confirmar que la peticion llevaba
- * Authorization sin exponer la credencial, que era imposible cuando
- * simplemente se omitian.
+ * De las cabeceras sensibles se registra el nombre, en
+ * http.request.headers_redacted, pero no el valor. Permite confirmar que la
+ * peticion incluia Authorization sin exponer la credencial.
  *
- * OJO con traceparent y baggage: el agente puede inyectarlas por debajo de esta
- * capa, en el transporte HttpURLConnection, es decir DESPUES de que este
- * interceptor lea las cabeceras. Que no aparezcan aqui no significa que no se
- * hayan enviado. Para ver lo que llega de verdad al otro lado esta el endpoint
- * /get, que devuelve las cabeceras tal como las recibio el destino.
+ * traceparent y baggage pueden inyectarse por debajo de esta capa, en el
+ * transporte HttpURLConnection, es decir despues de que el interceptor lea las
+ * cabeceras: su ausencia aqui no implica que no se hayan enviado. El endpoint
+ * /get devuelve las cabeceras tal como las recibio el destino.
  */
 public class OutboundHttpLoggingInterceptor implements ClientHttpRequestInterceptor {
 
@@ -72,10 +70,10 @@ public class OutboundHttpLoggingInterceptor implements ClientHttpRequestIntercep
     private final String dependencyName;
 
     /**
-     * Si se registran los cuerpos. Debe quedar en false contra cualquier
-     * dependencia que devuelva datos de personas: el cuerpo se enviaria entero a
-     * New Relic. Solo tiene sentido en true contra destinos inocuos, como
-     * httpbin.org, donde la gracia es precisamente ver el payload.
+     * Indica si se registran los cuerpos. Debe permanecer en false contra
+     * cualquier dependencia que devuelva datos personales, ya que el cuerpo se
+     * enviaria completo a New Relic. Se activa solo contra destinos sin datos
+     * sensibles, como httpbin.org.
      */
     private final boolean logBodies;
 

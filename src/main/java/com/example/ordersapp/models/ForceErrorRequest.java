@@ -7,10 +7,10 @@ import jakarta.validation.constraints.NotNull;
 /**
  * Entrada del endpoint /force-errors.
  *
- * El rango 400-599 se valida con anotaciones a proposito: asi un valor fuera de
- * rango lo rechaza Spring con MethodArgumentNotValidException, que el
- * GlobalExceptionHandler ya traduce a un 400 con el cuerpo de error estandar y
- * el detalle por campo. No hay que escribir esa comprobacion a mano.
+ * El rango 400-599 se valida con anotaciones para que un valor fuera de rango
+ * lo rechace Spring con MethodArgumentNotValidException, que el
+ * GlobalExceptionHandler traduce a un 400 con el cuerpo de error estandar y el
+ * detalle por campo.
  */
 public class ForceErrorRequest {
 

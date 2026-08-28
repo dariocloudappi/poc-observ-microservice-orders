@@ -62,10 +62,10 @@ public class UserValidationService {
                     // wrapper deja la puerta abierta sin romper nada.
                     return new BufferingClientHttpRequestFactory(factory);
                 })
-                // logBodies en FALSE a proposito: la respuesta de este servicio
-                // trae nombre y email de una persona. Se registran la url, el
-                // codigo y la duracion, nunca el payload. La cabecera
-                // Authorization tampoco se registra, va en SENSITIVE_HEADERS.
+                // logBodies en false: la respuesta de este servicio contiene
+                // nombre y correo de una persona. Se registran la url, el codigo
+                // y la duracion, nunca el payload. La cabecera Authorization
+                // tampoco se registra, figura en SENSITIVE_HEADERS.
                 .additionalInterceptors(new OutboundHttpLoggingInterceptor(DEPENDENCY, false))
                 .build();
         // Se normaliza aqui una sola vez para no repetir la concatenacion.
@@ -116,7 +116,7 @@ public class UserValidationService {
             UserSingleEnvelope envelope = response.getBody();
             if (envelope == null || envelope.getData() == null) {
                 Observability.attr("error.type", "EmptyUsersResponse");
-                // ERROR de verdad: el upstream contesto 2xx con un cuerpo que
+                // Nivel ERROR: el upstream respondio 2xx con un cuerpo que
                 // incumple el contrato. Es un fallo de integracion, no del
                 // cliente.
                 log.atError()
@@ -172,9 +172,9 @@ public class UserValidationService {
             Observability.attr("error.type", e.getClass().getSimpleName());
             Span.current().recordException(e);
 
-            // Distinguir esto del caso anterior importa: aqui no hubo respuesta
-            // en absoluto, o sea gateway caido, DNS o timeout. Es el sintoma de
-            // una averia de infraestructura, no de un pedido concreto.
+            // Caso distinto del anterior: aqui no hubo respuesta alguna, por
+            // gateway caido, DNS o timeout. Indica una averia de
+            // infraestructura, no un problema del pedido.
             log.atError()
                     .addKeyValue("user.id", userId)
                     .addKeyValue("users_api.endpoint", endpoint)

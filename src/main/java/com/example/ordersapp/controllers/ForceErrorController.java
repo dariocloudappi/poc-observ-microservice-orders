@@ -16,24 +16,24 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
- * Provoca errores a demanda, para poder probar alertas y dashboards sin esperar
- * a que algo se rompa de verdad.
+ * Provoca errores a demanda, para validar alertas y paneles sin esperar a un
+ * fallo real.
  *
  * El error recorre el mismo camino que un fallo real: se lanza una excepcion que
- * atiende el GlobalExceptionHandler, asi que en la telemetria queda con la
- * excepcion registrada en el span, el status del span en ERROR si es 5xx, y el
+ * atiende el GlobalExceptionHandler, de modo que en la telemetria queda con la
+ * excepcion registrada en el span, el status del span en ERROR si es 5xx y el
  * cuerpo de error estandar del servicio.
  *
- * Se marca ademas con error.forced = true. Eso permite excluir el ruido de las
- * demos de cualquier metrica de errores reales:
+ * Se marca con error.forced = true, lo que permite excluir estos errores de
+ * cualquier metrica de errores reales:
  *
  *   SELECT count(*) FROM Log WHERE error.code IS NOT NULL
  *   AND error.forced IS NULL
  *
- * SEGURIDAD: este endpoint permite a cualquier consumidor autenticado provocar
- * 5xx a voluntad. Va detras del Basic Auth como el resto, pero se puede apagar
- * sin desplegar codigo con app.force-errors.enabled a false, y entonces
- * responde 404 para no revelar que existe.
+ * Consideracion de seguridad: el endpoint permite a cualquier consumidor
+ * autenticado provocar respuestas 5xx. Queda detras del Basic Auth, como el
+ * resto, y se puede desactivar sin desplegar codigo con
+ * app.force-errors.enabled a false, caso en el que responde 404.
  */
 @RestController
 @RequestMapping("/force-errors")
@@ -64,8 +64,8 @@ public class ForceErrorController {
     }
 
     /**
-     * Atajo por query param, para poder generar muchos errores en un bucle
-     * cuando se prueba una alerta.
+     * Atajo por query param, para generar errores en bucle al validar una
+     * alerta.
      *
      * <pre>
      * for i in $(seq 1 50); do curl -u user:pass "$URL/force-errors?status=503"; done
@@ -79,7 +79,8 @@ public class ForceErrorController {
     }
 
     private ResponseEntity<Void> trigger(Integer status, String message) {
-        // Apagado: 404 y no 403, para no confirmar que la ruta existe.
+        // Desactivado: responde 404 y no 403, para no confirmar que la ruta
+        // existe.
         if (!enabled) {
             log.atWarn()
                     .addKeyValue("api.operation", "system.force_error")
@@ -87,8 +88,8 @@ public class ForceErrorController {
             return ResponseEntity.notFound().build();
         }
 
-        // El rango se valida aqui tambien, no solo con anotaciones: la variante
-        // GET no pasa por la validacion de @Valid del cuerpo.
+        // El rango se valida tambien aqui porque la variante GET no pasa por la
+        // validacion de @Valid del cuerpo.
         if (status == null || status < 400 || status > 599) {
             throw new ForcedErrorException(400,
                     "El parametro status es obligatorio y debe estar entre 400 y 599");
